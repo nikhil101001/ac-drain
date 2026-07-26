@@ -34,7 +34,7 @@ font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,sans-serif;
 main{max-width:520px;margin:0 auto;padding:20px 16px 40px}
 .top{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:14px}
 h1{margin:0;font-size:18px;font-weight:650;letter-spacing:-.2px}
-h1 em{display:block;font:600 10px/1.4 inherit;font-style:normal;color:var(--dim);
+h1 em{display:block;font-weight:600;font-size:10px;line-height:1.4;font-style:normal;color:var(--dim);
 letter-spacing:1px;text-transform:uppercase;margin-bottom:3px}
 .conn{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--dim)}
 .dot{width:9px;height:9px;border-radius:50%;background:var(--dim);transition:box-shadow .3s,background .3s}
@@ -54,16 +54,22 @@ border:2px solid var(--line);border-radius:9px 9px 13px 13px;background:var(--su
 .water{position:absolute;left:0;right:0;bottom:0;height:24%;background:var(--ac);
 opacity:.82;transition:height .8s cubic-bezier(.33,1,.68,1)}
 .water:after{content:"";position:absolute;left:0;right:0;top:0;height:2px;background:#fff;opacity:.5}
-.mk{position:absolute;left:0;right:0;border-top:1px dashed var(--dim);opacity:.5;
-text-align:right;font:700 9px/1 inherit;letter-spacing:.5px;color:var(--dim)}
-.mk b{display:inline-block;transform:translateY(-12px);padding-right:4px}
+/* height:0 is load-bearing. Without it the label gives .mk ~13px of height and
+   pushes border-top that far above the level it is meant to mark - which put the
+   90% line at the very top edge and clipped its label out of the tank entirely.
+   align-items:center then straddles the label across the zero-height line, and
+   its chip background stops the dashes striking through the text. */
+.mk{position:absolute;left:0;right:0;height:0;border-top:1px dashed var(--dim);opacity:.55;
+display:flex;align-items:center;justify-content:flex-end;font-weight:700;font-size:9px;line-height:1;
+letter-spacing:.4px;color:var(--dim)}
+.mk b{margin-right:3px;padding:2px 3px;border-radius:3px;background:var(--sunk)}
 .m70{bottom:70%}.m90{bottom:90%}
 .mk.on{opacity:1;border-top-style:solid}
 .m70.on{border-color:var(--warn);color:var(--warn)}
 .m90.on{border-color:var(--bad);color:var(--bad)}
 
 .hi{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center}
-.lbl{font:600 10px/1.4 inherit;letter-spacing:1px;text-transform:uppercase;color:var(--dim)}
+.lbl{font-weight:600;font-size:10px;line-height:1.4;letter-spacing:1px;text-transform:uppercase;color:var(--dim)}
 .st{font-size:23px;font-weight:700;letter-spacing:-.4px;line-height:1.15;color:var(--ac);margin:1px 0 3px}
 .sub{font-size:13px;color:var(--dim);min-height:19px}
 .bar{margin-top:11px;height:6px;border-radius:99px;background:var(--track);overflow:hidden}
@@ -80,20 +86,41 @@ background:rgba(255,79,82,.12);border:1px solid var(--bad);color:var(--bad)}
 .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:12px}
 @media(max-width:399px){.grid{grid-template-columns:repeat(2,1fr)}}
 .tile{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:11px 12px;min-width:0}
-.tile span{display:block;font:600 10px/1.4 inherit;letter-spacing:.6px;text-transform:uppercase;
+.tile span{display:block;font-weight:600;font-size:10px;line-height:1.4;letter-spacing:.6px;text-transform:uppercase;
 color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tile b{display:block;font-size:15px;font-weight:650;margin-top:2px;
 overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .g{color:var(--ok)}.a{color:var(--warn)}.r{color:var(--bad)}
 
 .act{display:flex;gap:10px;margin-top:14px}
-button{flex:1;padding:14px 10px;font:650 15px/1 inherit;border-radius:13px;cursor:pointer;
+button{flex:1;padding:14px 10px;font-weight:600;font-size:15px;line-height:1;border-radius:13px;cursor:pointer;
 border:1px solid var(--line);background:var(--card);color:var(--tx);
 transition:transform .08s,opacity .2s}
 button.p{background:var(--ok);border-color:var(--ok);color:#04160b}
 button:active:not(:disabled){transform:scale(.985)}
 button:disabled{opacity:.38;cursor:not-allowed}
 .hint{margin-top:9px;font-size:12px;color:var(--dim);text-align:center;min-height:17px}
+
+.sec{margin-top:20px;display:flex;align-items:baseline;justify-content:space-between;gap:10px}
+.sec h2{margin:0;font-weight:600;font-size:11px;line-height:1.4;letter-spacing:1px;text-transform:uppercase;color:var(--dim)}
+.sec a{font-size:11px;color:var(--info);text-decoration:none;font-weight:600}
+.sec a:hover{text-decoration:underline}
+.logwrap{margin-top:8px;border:1px solid var(--line);border-radius:14px;background:var(--card);
+max-height:290px;overflow-y:auto;-webkit-overflow-scrolling:touch}
+.row{display:flex;gap:10px;align-items:baseline;padding:9px 13px;border-bottom:1px solid var(--line)}
+.row:last-child{border-bottom:0}
+.row .t{flex:0 0 62px;font:500 11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dim)}
+.row .b{flex:1;min-width:0;font-size:13px}
+.row .b i{font-style:normal;color:var(--dim)}
+.row .p{flex:0 0 6px;height:6px;border-radius:50%;background:var(--dim);margin-top:6px}
+.row.ok .p{background:var(--ok)}.row.warn .p{background:var(--warn)}.row.bad .p{background:var(--bad)}
+.row.bad .b{color:var(--bad);font-weight:600}
+.empty{padding:16px 13px;font-size:13px;color:var(--dim);text-align:center}
+.day{padding:6px 13px;background:var(--sunk);border-bottom:1px solid var(--line);
+font-weight:600;font-size:10px;line-height:1.4;letter-spacing:.8px;text-transform:uppercase;color:var(--dim);
+position:sticky;top:0}
+.note{margin-top:8px;font-size:11px;line-height:1.6;color:var(--dim)}
+
 footer{margin-top:18px;text-align:center;font-size:11px;line-height:1.8;color:var(--dim)}
 footer code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
 
@@ -108,7 +135,7 @@ transform:translate(-50%,160%);transition:transform .3s cubic-bezier(.2,.9,.3,1)
 <main>
   <div class="top">
     <h1><em>Condensate drain</em>AC Drain Controller</h1>
-    <div class="conn"><span class="dot" id="dot"></span><span id="ct">connecting</span></div>
+    <div class="conn"><span class="dot" id="dot"></span><span id="ct">connecting</span><span id="ts"></span></div>
   </div>
 
   <section class="card hero" id="hero">
@@ -134,11 +161,11 @@ transform:translate(-50%,160%);transition:transform .3s cubic-bezier(.2,.9,.3,1)
 
   <section class="grid">
     <div class="tile"><span>Pump</span><b id="tp">&mdash;</b></div>
-    <div class="tile"><span>Manual switch</span><b id="tw">&mdash;</b></div>
-    <div class="tile"><span>Pump starts</span><b id="tc">&mdash;</b></div>
+    <div class="tile"><span>Switch</span><b id="tw">&mdash;</b></div>
+    <div class="tile"><span>Pump runs</span><b id="tc">&mdash;</b></div>
+    <div class="tile"><span>Overflows</span><b id="to">&mdash;</b></div>
     <div class="tile"><span>Total run</span><b id="tr">&mdash;</b></div>
     <div class="tile"><span>Uptime</span><b id="tu">&mdash;</b></div>
-    <div class="tile"><span>WiFi</span><b id="ts">&mdash;</b></div>
   </section>
 
   <section class="act">
@@ -146,6 +173,13 @@ transform:translate(-50%,160%);transition:transform .3s cubic-bezier(.2,.9,.3,1)
     <button id="boff" disabled>Stop pump</button>
   </section>
   <div class="hint" id="hint"></div>
+
+  <div class="sec">
+    <h2>Activity log</h2>
+    <a href="/api/log.csv" download>Download CSV</a>
+  </div>
+  <div class="logwrap" id="lw"><div class="empty">no events yet</div></div>
+  <div class="note" id="ln"></div>
 
   <footer>
     Auto cycle: 6 min per run, repeats while the 70% float is wet.<br>
@@ -213,15 +247,107 @@ function render(d) {
   set('tp', d.pump ? 'ON' : 'OFF', d.pump ? 'g' : '');
   set('tw', d.manual ? 'CLOSED' : 'open', d.manual ? 'a' : '');
   set('tc', d.starts);
+  set('to', d.overflows, d.overflows ? 'a' : '');
   set('tr', dur(d.pumpTotal));
   set('tu', dur(d.uptime));
-  set('ts', d.rssi ? d.rssi + ' dBm' : '—',
-      !d.rssi ? '' : d.rssi > -67 ? 'g' : d.rssi > -78 ? 'a' : 'r');
+  $('ts').textContent = d.rssi ? d.rssi + ' dBm' : '';
   $('ip').textContent = d.ip;
 
   $('bon').disabled = busy || locked || d.pump;
   $('boff').disabled = busy || locked || !d.pump;
   $('hint').textContent = LOCK[s] || '';
+}
+
+/*
+ * Activity log.
+ *
+ * The controller is the single source of truth - nothing is kept in
+ * localStorage, so every phone and laptop that opens this page sees the same
+ * history rather than its own partial copy. We only ever ask for events newer
+ * than the last sequence number we hold, so the 2-second poll normally returns
+ * an empty array.
+ */
+const EV = [
+  ['Powered on',             ''    ],   // 0
+  ['Pump started',           'ok'  ],   // 1
+  ['Pump stopped',           ''    ],   // 2
+  ['Overflow — water at 90%','bad' ],   // 3
+  ['Overflow cleared',       'warn'],   // 4
+  ['Blockage — not draining','bad' ],   // 5
+  ['WiFi lost',              'warn'],   // 6
+  ['WiFi restored',          ''    ]    // 7
+];
+const CAUSE = ['', 'auto cycle', 'manual', 'rocker switch', 'overflow'];
+
+let evs = [], lastSeq = 0, bootEpoch = 0, lostOld = false;
+
+function evDate(sec) { return new Date((bootEpoch + sec) * 1000); }
+
+function evTime(sec) {
+  if (!bootEpoch) return '+' + dur(sec);     // clock not synced yet
+  return evDate(sec).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function evDetail(e) {
+  const [, , code, cause, detail] = e;
+  if (code === 1 && cause) return CAUSE[cause];
+  if (code === 2 && detail) return 'ran ' + dur(detail);
+  if (code === 4 && detail) return 'lasted ' + dur(detail);
+  return '';
+}
+
+function renderLog() {
+  const lw = $('lw');
+  if (!evs.length) { lw.innerHTML = '<div class="empty">no events yet</div>'; return; }
+
+  let html = '', day = '';
+  // Newest first, and capped: the device holds 256 but nobody scrolls that far.
+  for (const e of evs.slice(-80).reverse()) {
+    const [, sec, code] = e;
+    const [label, cls] = EV[code] || ['event', ''];
+
+    if (bootEpoch) {
+      const d = evDate(sec).toDateString();
+      if (d !== day) {
+        day = d;
+        const today = new Date().toDateString();
+        html += '<div class="day">' + (d === today ? 'Today' :
+          evDate(sec).toLocaleDateString([], { weekday: 'short', day: '2-digit', month: 'short' })) +
+          '</div>';
+      }
+    }
+    const det = evDetail(e);
+    html += '<div class="row ' + cls + '"><span class="p"></span>' +
+            '<span class="t">' + evTime(sec) + '</span>' +
+            '<span class="b">' + label + (det ? ' <i>· ' + det + '</i>' : '') + '</span></div>';
+  }
+  lw.innerHTML = html;
+
+  $('ln').textContent = evs.length + ' event' + (evs.length === 1 ? '' : 's') +
+    ' · held in RAM on the controller, last 256' +
+    (lostOld ? ' · older entries have been overwritten' : '') +
+    (bootEpoch ? '' : ' · times shown relative to boot until the clock syncs');
+}
+
+async function pollLog() {
+  const r = await fetch('/api/log?since=' + lastSeq, { cache: 'no-store' });
+  if (!r.ok) throw 0;
+  const d = await r.json();
+
+  // seq going backwards means the controller restarted: its ring is empty again,
+  // so drop what we have rather than stitching two boots together.
+  if (d.seq < lastSeq) { evs = []; lastSeq = 0; }
+
+  // NTP lands a few seconds after boot, which turns every "+3m" label into a
+  // real clock time - so a change here has to force a full re-render.
+  const bootChanged = (d.boot || 0) !== bootEpoch;
+  bootEpoch = d.boot || 0;
+  if (d.lost) lostOld = true;
+  if (d.ev.length) evs = evs.concat(d.ev);
+  if (evs.length > 300) evs = evs.slice(-300);
+
+  lastSeq = d.seq;
+  if (d.ev.length || bootChanged) renderLog();   // otherwise nothing changed
 }
 
 async function poll() {
@@ -230,6 +356,7 @@ async function poll() {
     const r = await fetch('/api/status', { cache: 'no-store' });
     if (!r.ok) throw 0;
     render(await r.json());
+    await pollLog();
     fails = 0;
     link(true);
   } catch (e) {

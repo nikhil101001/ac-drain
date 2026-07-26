@@ -27,10 +27,12 @@
  *  WEB
  *    GET  /              dashboard
  *    GET  /api/status    JSON status
+ *    GET  /api/log       event log, ?since=<seq> for incremental fetch
+ *    GET  /api/log.csv   same log as a CSV download
  *    POST /pump/on       manual run, capped at 6 min
  *    POST /pump/off      stop immediately
  *
- *  TELEGRAM   /status  /pumpon  /pumpoff  /uptime  /help
+ *  TELEGRAM   /status  /log  /pumpon  /pumpoff  /uptime  /help
  *             (a tap keyboard is attached, so nothing needs typing)
  *
  *  FIRST RUN
@@ -47,8 +49,19 @@
 #include <WebServer.h>
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
+#include <time.h>
 
-#include "secrets.h"   // copy secrets.example.h -> secrets.h and fill it in
+// Credentials live outside version control. Accepted either next to this
+// sketch or one level up at the repo root, so moving the file doesn't break
+// the build.
+#if __has_include("secrets.h")
+  #include "secrets.h"
+#elif __has_include("../secrets.h")
+  #include "../secrets.h"
+#else
+  #error "No secrets.h found. Copy secrets.example.h to secrets.h and fill it in."
+#endif
+
 #include "web_ui.h"
 
 // ---------------- PIN MAP ----------------
@@ -118,10 +131,88 @@ unsigned long pumpStarts    = 0;  // lifetime pump starts
 unsigned long lastStopMs    = 0;
 unsigned long lastAlertMs   = 0;
 unsigned long overflowStartMs = 0;
+unsigned long overflowCount = 0;  // lifetime 90% events
+unsigned long blockedCount  = 0;  // lifetime "ran a full cycle and still wet" events
 unsigned long lastTelegramPollMs = 0;
 unsigned long lastWifiTryMs = 0;
 
 char ipStr[16] = "0.0.0.0";       // cached: building it per request churned the heap
+
+// ---------------- EVENT LOG ----------------
+/*
+ * A fixed-size ring in RAM. Deliberately NOT in flash: this device switches a
+ * relay every few minutes, and writing each event to NVS/SPIFFS would burn
+ * flash endurance for no benefit. 256 entries x 8 bytes = 2 KB, allocated once
+ * at compile time - it cannot grow and cannot fragment the heap.
+ *
+ * The device is the single source of truth, so every browser that opens the
+ * dashboard sees the same history. The cost of staying out of flash is that the
+ * log starts empty after a power cycle; /api/log.csv exists to archive it
+ * off-device before that happens.
+ */
+enum EvCode : uint8_t {
+  EV_BOOT = 0, EV_PUMP_ON, EV_PUMP_OFF, EV_OVERFLOW_ON, EV_OVERFLOW_OFF,
+  EV_BLOCKED, EV_WIFI_DOWN, EV_WIFI_UP
+};
+enum EvCause : uint8_t {
+  CAUSE_NONE = 0, CAUSE_AUTO, CAUSE_MANUAL, CAUSE_SWITCH, CAUSE_OVERFLOW
+};
+
+struct LogEvent {
+  uint32_t sec;      // seconds since boot
+  uint16_t detail;   // run/overflow duration in seconds, else 0
+  uint8_t  code;
+  uint8_t  cause;
+};
+
+const uint16_t LOG_CAPACITY = 256;   // power of two, so the index is a mask not a modulo
+LogEvent logBuf[LOG_CAPACITY];
+uint32_t logSeq = 0;                 // total events ever recorded; also the next slot
+
+// Wall-clock epoch of boot, from NTP. 0 until sync, and the dashboard falls
+// back to uptime-relative labels in that case. Deliberately UTC with no
+// timezone applied - the browser localises it, so there is no offset to get
+// wrong on the device.
+uint32_t bootEpoch = 0;
+
+void logAdd(uint8_t code, uint8_t cause = CAUSE_NONE, uint16_t detail = 0) {
+  LogEvent& e = logBuf[logSeq & (LOG_CAPACITY - 1)];
+  e.sec    = millis() / 1000;
+  e.detail = detail;
+  e.code   = code;
+  e.cause  = cause;
+  logSeq++;
+}
+
+// Oldest sequence number still held in the ring. Anything below this has been
+// overwritten, so a client asking for it gets resynced instead of a silent gap.
+uint32_t logOldest() {
+  return (logSeq > LOG_CAPACITY) ? logSeq - LOG_CAPACITY : 0;
+}
+
+const char* evName(uint8_t code) {
+  switch (code) {
+    case EV_BOOT:         return "boot";
+    case EV_PUMP_ON:      return "pump_on";
+    case EV_PUMP_OFF:     return "pump_off";
+    case EV_OVERFLOW_ON:  return "overflow_on";
+    case EV_OVERFLOW_OFF: return "overflow_off";
+    case EV_BLOCKED:      return "blocked";
+    case EV_WIFI_DOWN:    return "wifi_down";
+    case EV_WIFI_UP:      return "wifi_up";
+  }
+  return "?";
+}
+
+const char* causeName(uint8_t cause) {
+  switch (cause) {
+    case CAUSE_AUTO:     return "auto";
+    case CAUSE_MANUAL:   return "manual";
+    case CAUSE_SWITCH:   return "switch";
+    case CAUSE_OVERFLOW: return "overflow";
+  }
+  return "";
+}
 
 // ---------------- SMALL HELPERS ----------------
 static inline const char* jbool(bool v) { return v ? "true" : "false"; }
@@ -174,15 +265,21 @@ long remainingSecs(unsigned long now) {
 }
 
 // ---------------- PUMP / INDICATORS ----------------
-void setPump(bool on) {
+// `cause` is only used for the log entry. Because setPump() is idempotent, the
+// log gets exactly one entry per real relay transition - no duplicates from the
+// overflow branch calling setPump(true) on every pass.
+void setPump(bool on, uint8_t cause = CAUSE_NONE) {
   if (pumpOn == on) return;              // idempotent: no relay chatter, no double-counted runtime
   const unsigned long now = millis();
   if (on) {
     pumpSinceMs = now;
     pumpStarts++;
+    logAdd(EV_PUMP_ON, cause);
   } else {
+    const unsigned long runS = (now - pumpSinceMs) / 1000;
     pumpTotalMs += now - pumpSinceMs;
     lastStopMs = now;                    // single place that records a stop
+    logAdd(EV_PUMP_OFF, cause, runS > 65535 ? 65535 : (uint16_t)runS);
   }
   pumpOn = on;
   digitalWrite(PIN_PUMP, (RELAY_ACTIVE_LOW != on) ? HIGH : LOW);
@@ -206,7 +303,7 @@ const char* stopBlockedReason() {
 void startManualRun() {
   pumpStartMs = millis();
   state = ST_MANUAL;
-  setPump(true);
+  setPump(true, CAUSE_MANUAL);
 }
 
 // ---------------- TELEGRAM ----------------
@@ -216,7 +313,7 @@ void startManualRun() {
  * that line up in both the phone and desktop clients. One glyph per message,
  * no decoration beyond that.
  */
-const char* KEYBOARD_JSON = "[[\"/status\"],[\"/pumpon\",\"/pumpoff\"],[\"/uptime\"]]";
+const char* KEYBOARD_JSON = "[[\"/status\",\"/log\"],[\"/pumpon\",\"/pumpoff\"]]";
 
 void telegramSend(const char* html) {
   if (wifiUp) bot.sendMessage(CHAT_ID, html, "HTML");
@@ -228,6 +325,59 @@ void telegramReply(const String& chat_id, const char* html) {
 
 void telegramReplyWithMenu(const String& chat_id, const char* html) {
   bot.sendMessageWithReplyKeyboard(chat_id, html, "HTML", KEYBOARD_JSON, true);
+}
+
+// One log line for chat: "pump off, 6m run". Relative ages are used rather than
+// clock times so this needs no timezone handling on the device.
+void evLabelShort(const LogEvent& e, char* out, size_t n) {
+  char d[16];
+  switch (e.code) {
+    case EV_PUMP_ON:
+      snprintf(out, n, "pump on (%s)", causeName(e.cause));
+      break;
+    case EV_PUMP_OFF:
+      fmtDur(d, sizeof d, e.detail);
+      snprintf(out, n, "pump off, %s run", d);
+      break;
+    case EV_OVERFLOW_ON:  snprintf(out, n, "OVERFLOW 90%%"); break;
+    case EV_OVERFLOW_OFF:
+      fmtDur(d, sizeof d, e.detail);
+      snprintf(out, n, "overflow cleared, %s", d);
+      break;
+    case EV_BLOCKED:      snprintf(out, n, "BLOCKED - not draining"); break;
+    case EV_WIFI_DOWN:    snprintf(out, n, "wifi lost"); break;
+    case EV_WIFI_UP:      snprintf(out, n, "wifi back"); break;
+    default:              snprintf(out, n, "powered on"); break;
+  }
+}
+
+// Last few events, newest first. Capped at LOG_TELEGRAM_LINES so a chat reply
+// never turns into a wall of text - the dashboard is for browsing the full ring.
+const uint8_t LOG_TELEGRAM_LINES = 8;
+
+void buildLogCard(char* out, size_t n) {
+  if (logSeq == 0) {
+    snprintf(out, n, "\xF0\x9F\x93\x8B <b>Recent activity</b>\nNothing logged yet.");
+    return;
+  }
+
+  const uint32_t oldest = logOldest();
+  uint32_t from = (logSeq > LOG_TELEGRAM_LINES) ? logSeq - LOG_TELEGRAM_LINES : 0;
+  if (from < oldest) from = oldest;
+
+  const unsigned long nowS = millis() / 1000;
+  size_t used = snprintf(out, n, "\xF0\x9F\x93\x8B <b>Recent activity</b>\n<pre>");
+
+  for (uint32_t s = logSeq; s-- > from; ) {          // newest first
+    const LogEvent& e = logBuf[s & (LOG_CAPACITY - 1)];
+    char label[40], ago[16];
+    evLabelShort(e, label, sizeof label);
+    fmtDur(ago, sizeof ago, nowS > e.sec ? nowS - e.sec : 0);
+    const int wrote = snprintf(out + used, n - used, "%-8s %s\n", ago, label);
+    if (wrote < 0 || (size_t)wrote >= n - used) break;   // out of room, stop cleanly
+    used += wrote;
+  }
+  snprintf(out + used, n - used, "</pre>");
 }
 
 void buildStatusCard(char* out, size_t n) {
@@ -260,13 +410,14 @@ void buildStatusCard(char* out, size_t n) {
     "Level    %s\n"
     "Switch   %s\n"
     "Run      %s\n"
+    "Runs     %lu, %lu overflow\n"
     "Total    %s\n"
     "Uptime   %s</pre>",
     stateGlyph(), stateName(),
     pumpOn ? "on" : "off",
     level,
     switchManual.state ? "closed" : "open",
-    run, total, up);
+    run, pumpStarts, overflowCount, total, up);
 }
 
 void handleTelegramMessages(int numNewMessages) {
@@ -278,8 +429,13 @@ void handleTelegramMessages(int numNewMessages) {
     text.toLowerCase();
 
     if (text == "/status") {
-      char card[320];
+      char card[384];
       buildStatusCard(card, sizeof card);
+      telegramReply(chat_id, card);
+
+    } else if (text == "/log") {
+      char card[512];
+      buildLogCard(card, sizeof card);
       telegramReply(chat_id, card);
 
     } else if (text == "/pumpon") {
@@ -300,7 +456,7 @@ void handleTelegramMessages(int numNewMessages) {
         snprintf(msg, sizeof msg, "\xE2\x9A\xA0\xEF\xB8\x8F <b>Refused</b>\n%s", why);
         telegramReply(chat_id, msg);
       } else {
-        setPump(false);
+        setPump(false, CAUSE_MANUAL);
         state = ST_IDLE;
         telegramReply(chat_id, "\xE2\x9A\xAA <b>Pump stopped</b>\nBack on the automatic cycle.");
       }
@@ -317,6 +473,7 @@ void handleTelegramMessages(int numNewMessages) {
       snprintf(msg, sizeof msg,
         "\xF0\x9F\x92\xA7 <b>AC Drain</b>\n"
         "<pre>/status   level, pump, uptime\n"
+        "/log      last 8 events\n"
         "/pumpon   6 min manual run\n"
         "/pumpoff  stop the pump\n"
         "/uptime   how long since boot</pre>\n"
@@ -341,19 +498,81 @@ void handleStatus() {
   snprintf(buf, sizeof buf,
     "{\"state\":%u,\"pump\":%s,\"reed70\":%s,\"reed90\":%s,\"manual\":%s,"
     "\"elapsed\":%lu,\"remaining\":%ld,\"duration\":%lu,\"blocked\":%s,"
-    "\"starts\":%lu,\"pumpTotal\":%lu,\"uptime\":%lu,\"rssi\":%d,\"ip\":\"%s\"}",
+    "\"starts\":%lu,\"overflows\":%lu,\"blocks\":%lu,"
+    "\"pumpTotal\":%lu,\"uptime\":%lu,\"rssi\":%d,\"ip\":\"%s\","
+    "\"seq\":%lu,\"boot\":%lu}",
     (unsigned)state, jbool(pumpOn), jbool(reedHigh.state), jbool(reedOverflow.state),
     jbool(switchManual.state),
     pumpOn ? (now - pumpSinceMs) / 1000 : 0UL,
     remainingSecs(now),
     RUN_DURATION_MS / 1000UL,
     jbool(overflowMaxRunHit),
-    pumpStarts, totalMs / 1000UL, now / 1000UL,
+    pumpStarts, overflowCount, blockedCount,
+    totalMs / 1000UL, now / 1000UL,
     wifiUp ? WiFi.RSSI() : 0,
-    ipStr);
+    ipStr,
+    (unsigned long)logSeq, (unsigned long)bootEpoch);
 
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", buf);
+}
+
+/*
+ * GET /api/log?since=<seq>
+ *
+ * Streamed with chunked encoding rather than assembled into one String: a full
+ * 256-event dump is ~8 KB, and building that on the heap is exactly the kind of
+ * allocation this firmware avoids. Events are emitted as compact arrays
+ * [seq, uptimeSec, code, cause, detail] - the dashboard owns the labels, so the
+ * wire format stays small on a 2-second poll.
+ */
+void handleLog() {
+  uint32_t since = server.hasArg("since")
+                 ? strtoul(server.arg("since").c_str(), nullptr, 10) : 0;
+  const uint32_t oldest = logOldest();
+  const bool truncated = since < oldest;   // caller fell behind the ring
+  if (truncated) since = oldest;
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+
+  char chunk[96];
+  snprintf(chunk, sizeof chunk,
+           "{\"seq\":%lu,\"oldest\":%lu,\"boot\":%lu,\"uptime\":%lu,\"lost\":%s,\"ev\":[",
+           (unsigned long)logSeq, (unsigned long)oldest, (unsigned long)bootEpoch,
+           millis() / 1000UL, jbool(truncated));
+  server.sendContent(chunk);
+
+  for (uint32_t s = since; s < logSeq; s++) {
+    const LogEvent& e = logBuf[s & (LOG_CAPACITY - 1)];
+    snprintf(chunk, sizeof chunk, "%s[%lu,%lu,%u,%u,%u]",
+             (s == since) ? "" : ",",
+             (unsigned long)s, (unsigned long)e.sec, e.code, e.cause, e.detail);
+    server.sendContent(chunk);
+  }
+
+  server.sendContent("]}");
+  server.sendContent("");   // zero-length chunk terminates the response
+}
+
+// GET /api/log.csv - archive the ring off-device before a power cycle clears it.
+void handleLogCsv() {
+  server.sendHeader("Content-Disposition", "attachment; filename=ac-drain-log.csv");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+  server.sendContent("seq,epoch,uptime_s,event,cause,duration_s\n");
+
+  char chunk[110];
+  for (uint32_t s = logOldest(); s < logSeq; s++) {
+    const LogEvent& e = logBuf[s & (LOG_CAPACITY - 1)];
+    snprintf(chunk, sizeof chunk, "%lu,%lu,%lu,%s,%s,%u\n",
+             (unsigned long)s,
+             bootEpoch ? (unsigned long)(bootEpoch + e.sec) : 0UL,
+             (unsigned long)e.sec, evName(e.code), causeName(e.cause), e.detail);
+    server.sendContent(chunk);
+  }
+  server.sendContent("");
 }
 
 void handlePumpOn() {
@@ -366,7 +585,7 @@ void handlePumpOn() {
 void handlePumpOff() {
   const char* why = stopBlockedReason();
   if (why) { server.send(409, "text/plain", why); return; }
-  setPump(false);
+  setPump(false, CAUSE_MANUAL);
   state = ST_IDLE;
   server.send(200, "text/plain", "Pump stopped");
 }
@@ -378,9 +597,11 @@ void handleOverflow(unsigned long now) {
       // Leaving overflow MUST stop the pump. Previously the state was reset to
       // idle with the relay still closed, so if the 70% float was dry too the
       // pump had nothing left to switch it off and ran indefinitely.
-      setPump(false);
+      setPump(false, CAUSE_OVERFLOW);
       state = ST_IDLE;
       overflowAlerted = false;
+      const unsigned long heldS = (now - overflowStartMs) / 1000;
+      logAdd(EV_OVERFLOW_OFF, CAUSE_NONE, heldS > 65535 ? 65535 : (uint16_t)heldS);
       Serial.println("[OVERFLOW] cleared - resuming normal operation");
     }
     writeIfChanged(PIN_LED_RED, ledRedOn, false);
@@ -392,6 +613,8 @@ void handleOverflow(unsigned long now) {
     state = ST_OVERFLOW;
     overflowStartMs = now;
     overflowMaxRunHit = false;
+    overflowCount++;
+    logAdd(EV_OVERFLOW_ON);
     Serial.println("[OVERFLOW] 90% reached - forcing pump ON");
   }
 
@@ -399,10 +622,12 @@ void handleOverflow(unsigned long now) {
   writeIfChanged(PIN_BUZZER, buzzerOn, true);
 
   if (!overflowMaxRunHit) {
-    setPump(true);
+    setPump(true, CAUSE_OVERFLOW);
     if (now - overflowStartMs >= RUN_DURATION_MS) {
       overflowMaxRunHit = true;
-      setPump(false);
+      setPump(false, CAUSE_OVERFLOW);
+      blockedCount++;
+      logAdd(EV_BLOCKED);
       Serial.println("[OVERFLOW] full run done, still wet - pump stopped, needs a look");
       telegramSend("\xF0\x9F\x94\xB4 <b>Not draining</b>\n"
                    "The pump ran a full 6-minute cycle and the water is still at 90%. "
@@ -425,11 +650,11 @@ void handleManualSwitch() {
   if (switchManual.state) {
     if (state != ST_MANUAL_SWITCH) {
       state = ST_MANUAL_SWITCH;
-      setPump(true);
+      setPump(true, CAUSE_SWITCH);
       Serial.println("[MANUAL SWITCH] pump ON - runs until the switch opens");
     }
   } else if (state == ST_MANUAL_SWITCH) {
-    setPump(false);
+    setPump(false, CAUSE_SWITCH);
     state = ST_IDLE;
     Serial.println("[MANUAL SWITCH] pump OFF - switch opened");
   }
@@ -441,7 +666,7 @@ void handleAutoCycle(unsigned long now) {
       if (reedHigh.state && (now - lastStopMs) >= MIN_OFF_MS) {
         pumpStartMs = now;
         state = ST_RUNNING;
-        setPump(true);
+        setPump(true, CAUSE_AUTO);
         Serial.println("[CYCLE] 70% reached - pump ON for 6 min");
       }
       break;
@@ -450,7 +675,7 @@ void handleAutoCycle(unsigned long now) {
     case ST_MANUAL:
       if (now - pumpStartMs >= RUN_DURATION_MS) {
         const bool wasAuto = (state == ST_RUNNING);
-        setPump(false);
+        setPump(false, wasAuto ? CAUSE_AUTO : CAUSE_MANUAL);
         state = ST_IDLE;
         // Still wet? ST_IDLE above starts a fresh cycle once MIN_OFF_MS has
         // passed - that is the "repeat automatically" behaviour.
@@ -471,14 +696,27 @@ void cacheIp() {
   ipStr[sizeof(ipStr) - 1] = '\0';
 }
 
+// Fixes the log's wall-clock reference once, then never asks again. The device
+// keeps no calendar of its own - events store uptime seconds, and bootEpoch is
+// what lets the dashboard render them as real times.
+void syncClock() {
+  if (bootEpoch || !wifiUp) return;
+  const time_t t = time(nullptr);
+  if (t < 1700000000) return;                    // SNTP hasn't answered yet
+  bootEpoch = (uint32_t)t - (uint32_t)(millis() / 1000);
+  Serial.printf("[TIME] clock synced, boot epoch %lu\n", (unsigned long)bootEpoch);
+}
+
 void serviceWifi(unsigned long now) {
   const bool up = (WiFi.status() == WL_CONNECTED);
   if (up != wifiUp) {
     wifiUp = up;
     if (up) {
       cacheIp();
+      logAdd(EV_WIFI_UP);
       Serial.printf("[WIFI] connected - http://%s\n", ipStr);
     } else {
+      logAdd(EV_WIFI_DOWN);
       Serial.println("[WIFI] lost - retrying, pump logic keeps running locally");
     }
   }
@@ -488,6 +726,7 @@ void serviceWifi(unsigned long now) {
     lastWifiTryMs = now;
     WiFi.reconnect();
   }
+  syncClock();
 }
 
 void serviceTelegram() {
@@ -514,6 +753,7 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n[BOOT] AC drain controller");
+  logAdd(EV_BOOT);
 
   pinMode(PIN_LED_GREEN, OUTPUT); digitalWrite(PIN_LED_GREEN, LOW);
   pinMode(PIN_LED_RED, OUTPUT);   digitalWrite(PIN_LED_RED, LOW);
@@ -543,6 +783,9 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     wifiUp = true;
     cacheIp();
+    logAdd(EV_WIFI_UP);
+    // UTC only - the dashboard localises. Nothing to misconfigure here.
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     Serial.printf("[WIFI] connected - http://%s\n", ipStr);
     char msg[160];
     snprintf(msg, sizeof msg,
@@ -554,6 +797,8 @@ void setup() {
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/log", HTTP_GET, handleLog);
+  server.on("/api/log.csv", HTTP_GET, handleLogCsv);
   server.on("/pump/on", HTTP_POST, handlePumpOn);
   server.on("/pump/off", HTTP_POST, handlePumpOff);
   server.onNotFound([]() { server.send(404, "text/plain", "not found"); });
