@@ -1,0 +1,13 @@
+# Credentials - never commit. Use secrets.example.h as the template.
+secrets.h
+
+# Arduino / PlatformIO build output
+build/
+.pio/
+*.bin
+*.elf
+*.hex
+*.map
+
+# macOS
+.DS_Store
