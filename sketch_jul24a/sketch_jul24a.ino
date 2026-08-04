@@ -75,7 +75,12 @@ const uint8_t PIN_BUZZER        = 22;  // -> BC337 base via 1k
 // White LED: wire directly to 3V3 through a resistor. No pin used.
 
 // ---------------- CONFIG ----------------
-const bool RELAY_ACTIVE_LOW = true;   // most blue 5V relay modules: IN=LOW energises. Flip if backwards.
+// This build energises the relay on IN=HIGH, so the idle level is LOW. Getting
+// this backwards is not cosmetic: PUMP_IDLE_LEVEL is what setup() parks the pin
+// at before it becomes an output, so an inverted value runs the pump from boot
+// until the first float reading - continuously, ignoring every stop command.
+// The 10k pull-down on IN covers the same window before setup() gets to run.
+const bool RELAY_ACTIVE_LOW = false;
 const uint8_t PUMP_IDLE_LEVEL = RELAY_ACTIVE_LOW ? HIGH : LOW;
 
 const unsigned long LEVEL_DEBOUNCE_MS = 1000;
