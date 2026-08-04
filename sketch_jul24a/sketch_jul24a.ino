@@ -93,6 +93,13 @@ const uint8_t PUMP_IDLE_LEVEL = RELAY_ACTIVE_LOW ? HIGH : LOW;
 // raises an alert, rather than failing silently with the pump disabled.
 const bool SWITCH_CLOSED_IS_ENABLED = true;
 
+// Sound the buzzer briefly at boot. An alarm that is only ever exercised by a
+// real 90% overflow is one nobody finds out is dead until the moment it
+// matters, and it makes "is the buzzer broken?" answerable in two seconds
+// instead of requiring a wet float. Set false if the beep becomes annoying.
+const bool BUZZER_BOOT_TEST    = true;
+const unsigned long BUZZER_BOOT_TEST_MS = 250;
+
 const unsigned long LEVEL_DEBOUNCE_MS = 1000;
 const unsigned long RUN_DURATION_MS   = 5UL * 60UL * 1000UL + 30UL * 1000UL;  // 5 min 30 s
 const unsigned long MIN_OFF_MS        = 5UL * 1000UL;          // gap between auto-repeats
@@ -859,6 +866,15 @@ void setup() {
   pinMode(PIN_LED_GREEN, OUTPUT); digitalWrite(PIN_LED_GREEN, LOW);
   pinMode(PIN_LED_RED, OUTPUT);   digitalWrite(PIN_LED_RED, LOW);
   pinMode(PIN_BUZZER, OUTPUT);    digitalWrite(PIN_BUZZER, LOW);
+
+  // Self-test: if this is silent, the fault is in the buzzer wiring rather
+  // than in the overflow logic that normally drives the same pin.
+  if (BUZZER_BOOT_TEST) {
+    Serial.println("[BUZZER] self-test - listen for one short beep");
+    digitalWrite(PIN_BUZZER, HIGH);
+    delay(BUZZER_BOOT_TEST_MS);
+    digitalWrite(PIN_BUZZER, LOW);
+  }
 
   reedHigh.begin(PIN_REED_HIGH);
   reedOverflow.begin(PIN_REED_OVERFLOW);
