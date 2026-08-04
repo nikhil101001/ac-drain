@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+#
+# ============================================================
+#  flash - compile, upload and monitor an ESP32 sketch
+# ============================================================
+#
+#   ./flash                 pick a sketch from a menu, then flash and monitor
+#   ./flash relay           fuzzy match - "relay" finds relay_test
+#   ./flash main            "main" is an alias for sketch_jul24a
+#   ./flash relay -n        flash, then exit without opening the monitor
+#   ./flash -m relay        monitor only, no compile or upload
+#   ./flash -r              hard reset the board, restarting the sketch
+#   ./flash -l              list sketches, ports and the detected toolchain
+#
+# Everything is auto-detected: arduino-cli inside the Arduino IDE bundle, the
+# USB serial port, and each sketch's baud rate read from its Serial.begin call.
+#
+# To watch a sketch boot, press the EN button on the board with the monitor
+# already open. Neither -m nor -r can show you boot output: opening the monitor
+# does not reset the board, and -r has to close the monitor to get at the port,
+# so the first second of output is gone before the monitor is back. Two
+# processes sharing one serial port is not a workaround - it wedges the board.
+#
+# Written for bash 3.2, which is what macOS ships, so no mapfile and no
+# associative arrays.
+
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+FQBN="${AC_FQBN:-esp32:esp32:esp32}"
+PORT="${AC_PORT:-}"
+BAUD=""
+SKETCH=""
+DO_BUILD=1
+DO_MONITOR=1
+DO_RESET=0
+
+# ---------------- output ----------------
+if [ -t 1 ]; then
+  R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[1m'; Z=$'\033[0m'
+else
+  R=""; G=""; Y=""; B=""; Z=""
+fi
+say()  { printf '%s==>%s %s\n' "$B" "$Z" "$*"; }
+warn() { printf '%s warn%s %s\n' "$Y" "$Z" "$*" >&2; }
+die()  { printf '%serror%s %s\n' "$R" "$Z" "$*" >&2; exit 1; }
+
+# ---------------- toolchain ----------------
+# The IDE bundles arduino-cli but never puts it on PATH, so a plain install of
+# Arduino IDE is enough - nothing extra to install via brew.
+find_cli() {
+  if command -v arduino-cli >/dev/null 2>&1; then
+    command -v arduino-cli
+    return
+  fi
+  local bundled="/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli"
+  if [ -x "$bundled" ]; then
+    printf '%s\n' "$bundled"
+    return
+  fi
+  die "arduino-cli not found. Install Arduino IDE, or: brew install arduino-cli"
+}
+
+find_esptool() {
+  # Newest core first, so a version bump does not need editing here.
+  ls -1d "$HOME"/Library/Arduino15/packages/esp32/tools/esptool_py/*/esptool 2>/dev/null |
+    sort -V | tail -1
+}
+
+# ---------------- sketches ----------------
+# A sketch is a directory holding a .ino of the same name - the Arduino rule.
+list_sketches() {
+  local d n
+  for d in */; do
+    n="${d%/}"
+    [ -f "$n/$n.ino" ] && printf '%s\n' "$n"
+  done
+}
+
+# Exact name wins, then unique prefix, then unique substring. Anything
+# ambiguous stops rather than guessing which board to overwrite.
+resolve_sketch() {
+  local want="$1" all hit n
+  all=$(list_sketches)
+  [ -n "$all" ] || die "no sketches here - expected a dir/dir.ino pair"
+
+  # "main" is easier to remember than the IDE's default sketch_jul24a name.
+  if [ "$want" = "main" ]; then
+    printf '%s\n' "$all" | grep -qx "sketch_jul24a" && { printf 'sketch_jul24a\n'; return; }
+  fi
+
+  printf '%s\n' "$all" | grep -qx "$want" && { printf '%s\n' "$want"; return; }
+
+  hit=$(printf '%s\n' "$all" | grep -i "^$want" || true)
+  [ -z "$hit" ] && hit=$(printf '%s\n' "$all" | grep -i "$want" || true)
+
+  n=$(printf '%s\n' "$hit" | grep -c . || true)
+  case "$n" in
+    0) die "no sketch matches '$want'. Available: $(printf '%s' "$all" | tr '\n' ' ')" ;;
+    1) printf '%s\n' "$hit" ;;
+    *) die "'$want' is ambiguous: $(printf '%s' "$hit" | tr '\n' ' ')" ;;
+  esac
+}
+
+menu_sketch() {
+  local all count i=1 choice
+  all=$(list_sketches)
+  count=$(printf '%s\n' "$all" | grep -c . || true)
+  [ "$count" -gt 0 ] || die "no sketches here - expected a dir/dir.ino pair"
+
+  # Non-interactive callers get the list rather than a prompt into the void.
+  [ -t 0 ] || die "no sketch given. Available: $(printf '%s' "$all" | tr '\n' ' ')"
+
+  printf '%sWhich sketch?%s\n' "$B" "$Z" >&2
+  while read -r s; do
+    printf '  %d) %s\n' "$i" "$s" >&2
+    i=$((i + 1))
+  done <<EOF
+$all
+EOF
+  printf 'choice [1]: ' >&2
+  read -r choice || true
+  [ -n "$choice" ] || choice=1
+  printf '%s\n' "$all" | sed -n "${choice}p" | grep . || die "not a valid choice"
+}
+
+# ---------------- port ----------------
+# Every common ESP32 USB bridge: CP210x, CH340, and the generic FTDI naming.
+list_ports() {
+  ls -1 /dev/cu.usbserial* /dev/cu.SLAB_USBtoUART* /dev/cu.wchusbserial* \
+        /dev/cu.usbmodem* 2>/dev/null || true
+}
+
+find_port() {
+  local ports count
+  ports=$(list_ports)
+  count=$(printf '%s\n' "$ports" | grep -c . || true)
+  case "$count" in
+    0) die "no ESP32 found. Plug it in, or pass --port /dev/cu.something" ;;
+    1) printf '%s\n' "$ports" ;;
+    *) die "several ports found - pick one with --port:
+$(printf '%s\n' "$ports" | sed 's/^/    /')" ;;
+  esac
+}
+
+# A held-open monitor makes both upload and esptool fail with a confusing
+# "port busy", so clear it out first. This is the single most common way the
+# flow breaks, and it is entirely self-inflicted.
+free_port() {
+  if pgrep -f "arduino-cli monitor" >/dev/null 2>&1; then
+    say "closing an open serial monitor"
+    pkill -f "arduino-cli monitor" >/dev/null 2>&1 || true
+    sleep 1
+  fi
+}
+
+# ---------------- sketch facts ----------------
+# Read the baud out of the sketch instead of hardcoding it, so a sketch that
+# changes its Serial.begin does not silently produce a screen of garbage.
+# Empty means the sketch never opens Serial at all - a real answer, not a
+# failure, and the caller is expected to say so rather than default silently.
+baud_for() {
+  local s="$1"
+  grep -oE 'Serial\.begin\([0-9]+' "$s/$s.ino" 2>/dev/null | head -1 | grep -oE '[0-9]+' || true
+}
+
+needs_secrets() {
+  grep -qE '^[[:space:]]*#[[:space:]]*include[[:space:]]*"secrets\.h"|__has_include\("(\.\./)?secrets\.h"\)' \
+    "$1/$1.ino" 2>/dev/null
+}
+
+check_secrets() {
+  local s="$1"
+  needs_secrets "$s" || return 0
+  [ -f secrets.h ] || [ -f "$s/secrets.h" ] && return 0
+  die "$s needs secrets.h. Copy it from secrets.example.h and fill it in:
+    cp sketch_jul24a/secrets.example.h secrets.h"
+}
+
+check_core() {
+  local core="${FQBN%%:*}:$(printf '%s' "$FQBN" | cut -d: -f2)"
+  "$CLI" core list 2>/dev/null | grep -q "^${core} " && return 0
+  warn "core $core may not be installed. If the build fails:"
+  warn "    \"$CLI\" core install $core"
+}
+
+# ---------------- actions ----------------
+do_reset() {
+  local esptool
+  esptool=$(find_esptool)
+  [ -n "$esptool" ] || die "esptool not found - install the esp32 core first"
+  # free_port is not politeness. esptool and a monitor holding the same port
+  # fight over DTR/RTS and can leave the board stuck in reset, silent and
+  # looking bricked until something re-opens the port cleanly.
+  free_port
+  say "resetting $PORT"
+  # read-mac is just a cheap excuse to connect; --after hard-reset does the work.
+  "$esptool" --port "$PORT" --after hard-reset --no-stub read-mac >/dev/null 2>&1 ||
+    warn "reset did not complete - the board may still have rebooted"
+}
+
+do_monitor() {
+  say "monitor on $PORT at $BAUD - press EN on the board to see it boot, ctrl-c to quit"
+  # Opening the monitor does not reset the board, so a sketch that already
+  # booted looks silent until it prints something. The EN button is the only
+  # reliable way to catch boot output, because it reboots the board while the
+  # port stays open in this one process.
+  exec "$CLI" monitor -p "$PORT" --config "baudrate=$BAUD"
+}
+
+# ---------------- args ----------------
+usage() {
+  # Print the header comment and stop at the first line of real code, so
+  # editing the header never desyncs --help from it.
+  awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0"
+  exit 0
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)         usage ;;
+    -l|--list)         DO_BUILD=0; DO_MONITOR=0; SKETCH="__list__" ;;
+    -n|--no-monitor)   DO_MONITOR=0 ;;
+    -m|--monitor-only) DO_BUILD=0 ;;
+    -r|--reset)        DO_RESET=1; DO_BUILD=0 ;;
+    -p|--port)         shift; [ $# -gt 0 ] || die "--port needs a value"; PORT="$1" ;;
+    -b|--baud)         shift; [ $# -gt 0 ] || die "--baud needs a value"; BAUD="$1" ;;
+    -f|--fqbn)         shift; [ $# -gt 0 ] || die "--fqbn needs a value"; FQBN="$1" ;;
+    -*)                die "unknown option $1 (try --help)" ;;
+    *)                 [ -z "$SKETCH" ] || die "only one sketch at a time"; SKETCH="$1" ;;
+  esac
+  shift
+done
+
+CLI=$(find_cli)
+
+# ---------------- list ----------------
+if [ "$SKETCH" = "__list__" ]; then
+  printf '%ssketches%s\n' "$B" "$Z"
+  while read -r s; do
+    [ -n "$s" ] || continue
+    extra=""
+    needs_secrets "$s" && extra=" (needs secrets.h)"
+    b=$(baud_for "$s")
+    if [ -n "$b" ]; then
+      printf '  %-16s %s baud%s\n' "$s" "$b" "$extra"
+    else
+      printf '  %-16s no serial output%s\n' "$s" "$extra"
+    fi
+  done <<EOF
+$(list_sketches)
+EOF
+  printf '\n%sports%s\n' "$B" "$Z"
+  p=$(list_ports)
+  if [ -n "$p" ]; then printf '%s\n' "$p" | sed 's/^/  /'; else printf '  none found\n'; fi
+  printf '\n%stoolchain%s\n  cli   %s\n  fqbn  %s\n' "$B" "$Z" "$CLI" "$FQBN"
+  e=$(find_esptool); printf '  reset %s\n' "${e:-esptool not found}"
+  exit 0
+fi
+
+# ---------------- resolve ----------------
+[ -n "$PORT" ] || PORT=$(find_port)
+
+# Only a build genuinely needs to know which sketch. Reset and monitor act on
+# the board that is already flashed, so asking there would be a question with
+# no useful answer - a bare -r resets whatever is plugged in.
+if [ "$DO_BUILD" = 1 ]; then
+  if [ -z "$SKETCH" ]; then
+    SKETCH=$(menu_sketch)
+  else
+    SKETCH=$(resolve_sketch "$SKETCH")
+  fi
+elif [ -n "$SKETCH" ]; then
+  SKETCH=$(resolve_sketch "$SKETCH")   # named only to borrow its baud rate
+fi
+
+NO_SERIAL=0
+if [ -z "$BAUD" ]; then
+  [ -n "$SKETCH" ] && BAUD=$(baud_for "$SKETCH")
+  # sketch_jul24a reports through the web page and Telegram, not the cable, so
+  # its monitor is legitimately empty. Say that instead of leaving someone
+  # staring at a blank window wondering what broke.
+  [ -n "$BAUD" ] || { BAUD=115200; [ -n "$SKETCH" ] && NO_SERIAL=1; }
+fi
+
+# ---------------- run ----------------
+if [ "$DO_BUILD" = 1 ]; then
+  check_secrets "$SKETCH"
+  check_core
+
+  say "compiling $SKETCH"
+  "$CLI" compile --fqbn "$FQBN" "$SKETCH" || die "compile failed - nothing was uploaded"
+
+  free_port
+  say "uploading to $PORT"
+  "$CLI" upload --fqbn "$FQBN" -p "$PORT" "$SKETCH" || die "upload failed.
+    Board not in download mode? Hold BOOT, tap EN, release BOOT, then retry."
+
+  printf '%s ok %s %s is running\n' "$G" "$Z" "$SKETCH"
+fi
+
+[ "$DO_RESET" = 1 ] && do_reset
+
+if [ "$DO_MONITOR" = 1 ]; then
+  [ "$NO_SERIAL" = 1 ] &&
+    warn "$SKETCH never calls Serial.begin - the monitor will stay empty by design"
+  free_port
+  do_monitor
+fi
