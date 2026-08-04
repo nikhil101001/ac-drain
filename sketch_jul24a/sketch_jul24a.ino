@@ -248,6 +248,22 @@ const char* causeName(uint8_t cause) {
 // ---------------- SMALL HELPERS ----------------
 static inline const char* jbool(bool v) { return v ? "true" : "false"; }
 
+/*
+ * How long ago `start` was, from the loop's cached `now`.
+ *
+ * Not just `now - start`: web and Telegram handlers stamp millis() themselves,
+ * and server.handleClient() runs *after* loop() samples `now`. A run started
+ * from the dashboard therefore carries a timestamp a millisecond or two in the
+ * future, the plain subtraction underflows to ~49 days, and every "has it been
+ * long enough?" test fires instantly - which killed manual runs in the same
+ * pass that started them. Anything more than half the millis() range in the
+ * past is really a timestamp from the future, so report it as no time at all.
+ */
+static inline unsigned long elapsedSince(unsigned long now, unsigned long start) {
+  const unsigned long d = now - start;
+  return (d > (~0UL / 2)) ? 0UL : d;
+}
+
 // Writes the pin only when the value actually changes. The overflow branch used
 // to re-issue the same digitalWrite thousands of times a second.
 static inline void writeIfChanged(uint8_t pin, bool& cache, bool on) {
@@ -293,8 +309,8 @@ const char* stateGlyph() {
 // stopped state, so a held cycle can't be mistaken for a cancelled one.
 long remainingSecs(unsigned long now) {
   unsigned long elapsed;
-  if (state == ST_RUNNING || state == ST_MANUAL)            elapsed = now - pumpStartMs;
-  else if (state == ST_OVERFLOW && !overflowMaxRunHit)      elapsed = now - overflowStartMs;
+  if (state == ST_RUNNING || state == ST_MANUAL)            elapsed = elapsedSince(now, pumpStartMs);
+  else if (state == ST_OVERFLOW && !overflowMaxRunHit)      elapsed = elapsedSince(now, overflowStartMs);
   else if (state == ST_SWITCH_OFF && heldState != ST_IDLE)  elapsed = heldElapsedMs;
   else                                                      return -1;
   return elapsed >= RUN_DURATION_MS ? 0 : (long)((RUN_DURATION_MS - elapsed) / 1000);
@@ -733,7 +749,7 @@ void serviceEnableSwitch(unsigned long now) {
   if (state == ST_SWITCH_OFF) return;
 
   if (state == ST_RUNNING || state == ST_MANUAL) {
-    const unsigned long elapsed = now - pumpStartMs;
+    const unsigned long elapsed = elapsedSince(now, pumpStartMs);
     heldElapsedMs = (elapsed >= RUN_DURATION_MS) ? RUN_DURATION_MS : elapsed;
     heldState = state;
   } else {
@@ -748,7 +764,7 @@ void serviceEnableSwitch(unsigned long now) {
 void handleAutoCycle(unsigned long now) {
   switch (state) {
     case ST_IDLE:
-      if (reedHigh.state && (now - lastStopMs) >= MIN_OFF_MS) {
+      if (reedHigh.state && elapsedSince(now, lastStopMs) >= MIN_OFF_MS) {
         pumpStartMs = now;
         state = ST_RUNNING;
         setPump(true, CAUSE_AUTO);
@@ -758,7 +774,7 @@ void handleAutoCycle(unsigned long now) {
 
     case ST_RUNNING:
     case ST_MANUAL:
-      if (now - pumpStartMs >= RUN_DURATION_MS) {
+      if (elapsedSince(now, pumpStartMs) >= RUN_DURATION_MS) {
         const bool wasAuto = (state == ST_RUNNING);
         setPump(false, wasAuto ? CAUSE_AUTO : CAUSE_MANUAL);
         state = ST_IDLE;
