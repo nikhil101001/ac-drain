@@ -161,7 +161,7 @@ transform:translate(-50%,160%);transition:transform .3s cubic-bezier(.2,.9,.3,1)
 
   <section class="grid">
     <div class="tile"><span>Pump</span><b id="tp">&mdash;</b></div>
-    <div class="tile"><span>Switch</span><b id="tw">&mdash;</b></div>
+    <div class="tile"><span>Manual switch</span><b id="tw">&mdash;</b></div>
     <div class="tile"><span>Pump runs</span><b id="tc">&mdash;</b></div>
     <div class="tile"><span>Overflows</span><b id="to">&mdash;</b></div>
     <div class="tile"><span>Total run</span><b id="tr">&mdash;</b></div>
@@ -190,17 +190,17 @@ transform:translate(-50%,160%);transition:transform .3s cubic-bezier(.2,.9,.3,1)
 
 <script>
 const $ = id => document.getElementById(id);
-const NAME = ['Idle', 'Auto cycle', 'Manual run', 'Manual switch', 'Overflow'];
+const NAME = ['Idle', 'Auto cycle', 'Manual run', 'Switched off', 'Overflow'];
 const SUB = [
   'Waiting for the 70% float',
   'Draining on the automatic cycle',
   'Manual override, 5m 30s cap',
-  'Rocker switch held closed, no time limit',
+  'Manual switch is OFF — pump inhibited',
   'Water at 90% — clearing it'
 ];
 const LOCK = [
   '', '', '',
-  'Controls are locked while the manual rocker switch is closed.',
+  'Controls are locked — the manual switch is in the OFF position.',
   'Controls are locked — the overflow safety handler owns the pump.'
 ];
 let fails = 0, busy = false;
@@ -236,6 +236,11 @@ function render(d) {
     l = 'Pumping'; r = dur(d.remaining) + ' left';
   } else if (d.pump) {
     w = 100; l = 'Pumping'; r = dur(d.elapsed) + ' — no time limit';
+  } else if (s === 3 && d.remaining >= 0) {
+    // Cycle frozen by the switch, not cancelled. Showing the held remainder is
+    // the only way the operator can tell those two apart from the panel.
+    w = 100 * (d.duration - d.remaining) / d.duration;
+    l = 'Paused'; r = dur(d.remaining) + ' left on resume';
   } else if (s === 4) {
     l = 'Pump stopped'; r = 'not draining';
   }
@@ -245,7 +250,7 @@ function render(d) {
 
   $('al').className = 'banner' + (d.blocked ? '' : ' hide');
   set('tp', d.pump ? 'ON' : 'OFF', d.pump ? 'g' : '');
-  set('tw', d.manual ? 'CLOSED' : 'open', d.manual ? 'a' : '');
+  set('tw', d.enabled ? 'ON' : 'OFF', d.enabled ? '' : 'a');
   set('tc', d.starts);
   set('to', d.overflows, d.overflows ? 'a' : '');
   set('tr', dur(d.pumpTotal));
@@ -275,9 +280,11 @@ const EV = [
   ['Overflow cleared',       'warn'],   // 4
   ['Blockage — not draining','bad' ],   // 5
   ['WiFi lost',              'warn'],   // 6
-  ['WiFi restored',          ''    ]    // 7
+  ['WiFi restored',          ''    ],   // 7
+  ['Manual switch OFF',      'warn'],   // 8
+  ['Manual switch ON',       ''    ]    // 9
 ];
-const CAUSE = ['', 'auto cycle', 'manual', 'rocker switch', 'overflow'];
+const CAUSE = ['', 'auto cycle', 'manual', 'manual switch', 'overflow'];
 
 let evs = [], lastSeq = 0, bootEpoch = 0, lostOld = false;
 

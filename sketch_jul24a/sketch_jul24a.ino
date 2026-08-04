@@ -13,10 +13,14 @@
  *           If a full 5 min 30 s run does not drop the level, the pump is
  *           stopped (it plainly isn't draining) and a "check for a blockage"
  *           alert goes out. Better a wet tray than a burnt-out pump.
- *    Manual rocker switch
- *        -> pump runs for exactly as long as the switch is closed, no cap.
+ *    Manual switch  -  an ENABLE switch, not a run switch
+ *        -> OFF stops the pump at once and suspends automatic operation. The
+ *           run timer is FROZEN, not reset: switch back on with a float still
+ *           wet and the pump finishes the remainder of the 5 min 30 s rather
+ *           than starting the cycle over. A 90% overflow ignores the switch
+ *           entirely - water damage outranks it.
  *
- *  PRIORITY   overflow > manual switch > web/Telegram manual > auto cycle
+ *  PRIORITY   overflow > manual switch OFF > web/Telegram manual > auto cycle
  *
  *  LEDS
  *    White  - wired DIRECTLY to 3V3 through a resistor, no GPIO. Lit whenever
@@ -67,7 +71,7 @@
 // ---------------- PIN MAP ----------------
 const uint8_t PIN_REED_HIGH     = 33;  // 70% float - starts the cycle
 const uint8_t PIN_REED_OVERFLOW = 25;  // 90% float - safety
-const uint8_t PIN_SWITCH_MANUAL = 26;  // manual rocker - pump runs while closed
+const uint8_t PIN_SWITCH_MANUAL = 26;  // manual enable switch - OFF inhibits the pump
 const uint8_t PIN_PUMP          = 23;  // -> relay module IN
 const uint8_t PIN_LED_GREEN     = 19;  // motor-running indicator
 const uint8_t PIN_LED_RED       = 18;  // overflow indicator
@@ -83,6 +87,12 @@ const uint8_t PIN_BUZZER        = 22;  // -> BC337 base via 1k
 const bool RELAY_ACTIVE_LOW = false;
 const uint8_t PUMP_IDLE_LEVEL = RELAY_ACTIVE_LOW ? HIGH : LOW;
 
+// Which contact position means "automatic operation allowed". Default: closed
+// (pin pulled to GND) is enabled, so a broken switch wire lands on the
+// inhibited side - where the 90% handler still protects the tray and still
+// raises an alert, rather than failing silently with the pump disabled.
+const bool SWITCH_CLOSED_IS_ENABLED = true;
+
 const unsigned long LEVEL_DEBOUNCE_MS = 1000;
 const unsigned long RUN_DURATION_MS   = 5UL * 60UL * 1000UL + 30UL * 1000UL;  // 5 min 30 s
 const unsigned long MIN_OFF_MS        = 5UL * 1000UL;          // gap between auto-repeats
@@ -91,7 +101,7 @@ const unsigned long ALERT_COOLDOWN_MS = 5UL * 60UL * 1000UL;   // don't spam Tel
 const unsigned long WIFI_RETRY_MS     = 20UL * 1000UL;         // reconnect attempt spacing
 // RUN_DURATION_MS (5 min 30 s) is used for every timed pump run - auto cycle,
 // web/Telegram manual, and the overflow guard. It's not a safety margin, it's
-// the measured time to empty a full bucket. Only the manual switch ignores it.
+// the measured time to empty a full bucket.
 
 // ---------------- GLOBALS ----------------
 WebServer server(80);
@@ -120,14 +130,26 @@ struct DebouncedInput {
 
 DebouncedInput reedHigh, reedOverflow, switchManual;
 
-enum State : uint8_t { ST_IDLE = 0, ST_RUNNING, ST_MANUAL, ST_MANUAL_SWITCH, ST_OVERFLOW };
+// Index order is part of the dashboard's contract: web_ui.h indexes NAME, SUB
+// and LOCK by this value. Slot 3 is the inhibited state, not a running one.
+enum State : uint8_t { ST_IDLE = 0, ST_RUNNING, ST_MANUAL, ST_SWITCH_OFF, ST_OVERFLOW };
 State state = ST_IDLE;
 
 bool pumpOn = false;
 bool ledGreenOn = false, ledRedOn = false, buzzerOn = false;
 bool wifiUp = false;
-bool overflowMaxRunHit = false;   // 6 min of pumping didn't clear 90%
+bool overflowMaxRunHit = false;   // a full run didn't clear 90%
 bool overflowAlerted   = false;   // first alert of this overflow already sent
+
+// Enable-switch state, and the timed run it interrupted.
+//
+// Freezing is the whole point of holding these: when the switch goes off
+// mid-cycle we keep how far the run had got, so flipping it back on finishes
+// the remainder instead of restarting a 5 min 30 s run that was nearly done.
+// heldState is ST_IDLE when there is nothing to resume.
+bool switchEnabled  = true;       // debounced + polarity-corrected
+State heldState     = ST_IDLE;    // ST_RUNNING or ST_MANUAL if a run was frozen
+unsigned long heldElapsedMs = 0;  // how far that run had already got
 
 unsigned long pumpStartMs   = 0;  // start of the current *timed* run
 unsigned long pumpSinceMs   = 0;  // when the relay actually closed (runtime accounting)
@@ -155,9 +177,11 @@ char ipStr[16] = "0.0.0.0";       // cached: building it per request churned the
  * log starts empty after a power cycle; /api/log.csv exists to archive it
  * off-device before that happens.
  */
+// These numbers go out on the wire and the dashboard's EV table is indexed by
+// them, so new codes are appended - never inserted.
 enum EvCode : uint8_t {
   EV_BOOT = 0, EV_PUMP_ON, EV_PUMP_OFF, EV_OVERFLOW_ON, EV_OVERFLOW_OFF,
-  EV_BLOCKED, EV_WIFI_DOWN, EV_WIFI_UP
+  EV_BLOCKED, EV_WIFI_DOWN, EV_WIFI_UP, EV_SWITCH_OFF, EV_SWITCH_ON
 };
 enum EvCause : uint8_t {
   CAUSE_NONE = 0, CAUSE_AUTO, CAUSE_MANUAL, CAUSE_SWITCH, CAUSE_OVERFLOW
@@ -205,6 +229,8 @@ const char* evName(uint8_t code) {
     case EV_BLOCKED:      return "blocked";
     case EV_WIFI_DOWN:    return "wifi_down";
     case EV_WIFI_UP:      return "wifi_up";
+    case EV_SWITCH_OFF:   return "switch_off";
+    case EV_SWITCH_ON:    return "switch_on";
   }
   return "?";
 }
@@ -240,31 +266,36 @@ void fmtDur(char* out, size_t n, unsigned long secs) {
 
 const char* stateName() {
   switch (state) {
-    case ST_IDLE:          return "Idle";
-    case ST_RUNNING:       return "Auto cycle";
-    case ST_MANUAL:        return "Manual run";
-    case ST_MANUAL_SWITCH: return "Manual switch";
-    case ST_OVERFLOW:      return "Overflow";
+    case ST_IDLE:       return "Idle";
+    case ST_RUNNING:    return "Auto cycle";
+    case ST_MANUAL:     return "Manual run";
+    case ST_SWITCH_OFF: return "Switched off";
+    case ST_OVERFLOW:   return "Overflow";
   }
   return "Unknown";
 }
 
 const char* stateGlyph() {
   switch (state) {
-    case ST_IDLE:          return "\xE2\x9A\xAA";          // white circle
-    case ST_RUNNING:       return "\xF0\x9F\x9F\xA2";      // green circle
+    case ST_IDLE:       return "\xE2\x9A\xAA";          // white circle
+    case ST_RUNNING:    return "\xF0\x9F\x9F\xA2";      // green circle
     case ST_MANUAL:
-    case ST_MANUAL_SWITCH: return "\xF0\x9F\x9F\xA1";      // yellow circle
-    case ST_OVERFLOW:      return "\xF0\x9F\x94\xB4";      // red circle
+    case ST_SWITCH_OFF: return "\xF0\x9F\x9F\xA1";      // yellow circle
+    case ST_OVERFLOW:   return "\xF0\x9F\x94\xB4";      // red circle
   }
   return "\xE2\x9A\xAA";
 }
 
 // Seconds left in the current timed run, or -1 when nothing is timed.
+//
+// A run frozen by the enable switch still reports its remainder: that is what
+// lets the dashboard show "paused, 3m 40s left on resume" instead of a bare
+// stopped state, so a held cycle can't be mistaken for a cancelled one.
 long remainingSecs(unsigned long now) {
   unsigned long elapsed;
   if (state == ST_RUNNING || state == ST_MANUAL)            elapsed = now - pumpStartMs;
   else if (state == ST_OVERFLOW && !overflowMaxRunHit)      elapsed = now - overflowStartMs;
+  else if (state == ST_SWITCH_OFF && heldState != ST_IDLE)  elapsed = heldElapsedMs;
   else                                                      return -1;
   return elapsed >= RUN_DURATION_MS ? 0 : (long)((RUN_DURATION_MS - elapsed) / 1000);
 }
@@ -294,14 +325,14 @@ void setPump(bool on, uint8_t cause = CAUSE_NONE) {
 // Both control paths ask first, so the web UI, Telegram and the state machine
 // can never disagree about whether an override is allowed.
 const char* startBlockedReason() {
-  if (state == ST_OVERFLOW)      return "The 90% overflow float is wet.";
-  if (state == ST_MANUAL_SWITCH) return "The manual rocker switch is already holding the pump on.";
+  if (state == ST_OVERFLOW)   return "The 90% overflow float is wet.";
+  if (state == ST_SWITCH_OFF) return "The manual switch is in the OFF position - turn it on first.";
   return nullptr;
 }
 
 const char* stopBlockedReason() {
-  if (state == ST_OVERFLOW)      return "The overflow safety handler owns the pump right now.";
-  if (state == ST_MANUAL_SWITCH) return "The manual rocker switch is closed - flip it off to stop.";
+  if (state == ST_OVERFLOW)   return "The overflow safety handler owns the pump right now.";
+  if (state == ST_SWITCH_OFF) return "The manual switch is OFF - the pump is already stopped.";
   return nullptr;
 }
 
@@ -352,6 +383,8 @@ void evLabelShort(const LogEvent& e, char* out, size_t n) {
     case EV_BLOCKED:      snprintf(out, n, "BLOCKED - not draining"); break;
     case EV_WIFI_DOWN:    snprintf(out, n, "wifi lost"); break;
     case EV_WIFI_UP:      snprintf(out, n, "wifi back"); break;
+    case EV_SWITCH_OFF:   snprintf(out, n, "switch off"); break;
+    case EV_SWITCH_ON:    snprintf(out, n, "switch on"); break;
     default:              snprintf(out, n, "powered on"); break;
   }
 }
@@ -396,7 +429,8 @@ void buildStatusCard(char* out, size_t n) {
   if (rem >= 0) {
     char t[16];
     fmtDur(t, sizeof t, (unsigned long)rem);
-    snprintf(run, sizeof run, "%s left", t);
+    // A frozen run reads as "held", not "left" - the pump isn't running.
+    snprintf(run, sizeof run, (state == ST_SWITCH_OFF) ? "%s held" : "%s left", t);
   } else if (pumpOn) {
     char t[16];
     fmtDur(t, sizeof t, (now - pumpSinceMs) / 1000);
@@ -421,7 +455,7 @@ void buildStatusCard(char* out, size_t n) {
     stateGlyph(), stateName(),
     pumpOn ? "on" : "off",
     level,
-    switchManual.state ? "closed" : "open",
+    switchEnabled ? "on (auto)" : "off (inhibited)",
     run, pumpStarts, overflowCount, total, up);
 }
 
@@ -499,15 +533,19 @@ void handleStatus() {
 
   // Fixed buffer + snprintf instead of String concatenation: the dashboard
   // polls this every 2s forever, and String churn is what fragments the heap.
-  char buf[320];
+  // "manual" is the raw contact position; "enabled" is that with the polarity
+  // flag applied, which is the one the dashboard shows - so a flipped
+  // SWITCH_CLOSED_IS_ENABLED never leaves the panel disagreeing with the pump.
+  char buf[368];
   snprintf(buf, sizeof buf,
     "{\"state\":%u,\"pump\":%s,\"reed70\":%s,\"reed90\":%s,\"manual\":%s,"
+    "\"enabled\":%s,"
     "\"elapsed\":%lu,\"remaining\":%ld,\"duration\":%lu,\"blocked\":%s,"
     "\"starts\":%lu,\"overflows\":%lu,\"blocks\":%lu,"
     "\"pumpTotal\":%lu,\"uptime\":%lu,\"rssi\":%d,\"ip\":\"%s\","
     "\"seq\":%lu,\"boot\":%lu}",
     (unsigned)state, jbool(pumpOn), jbool(reedHigh.state), jbool(reedOverflow.state),
-    jbool(switchManual.state),
+    jbool(switchManual.state), jbool(switchEnabled),
     pumpOn ? (now - pumpSinceMs) / 1000 : 0UL,
     remainingSecs(now),
     RUN_DURATION_MS / 1000UL,
@@ -651,18 +689,60 @@ void handleOverflow(unsigned long now) {
   }
 }
 
-void handleManualSwitch() {
-  if (switchManual.state) {
-    if (state != ST_MANUAL_SWITCH) {
-      state = ST_MANUAL_SWITCH;
-      setPump(true, CAUSE_SWITCH);
-      Serial.println("[MANUAL SWITCH] pump ON - runs until the switch opens");
+// Contact position -> "automatic operation allowed", with the polarity flag
+// applied once here so nothing else has to reason about it.
+static inline bool switchIsEnabled() {
+  return SWITCH_CLOSED_IS_ENABLED ? switchManual.state : !switchManual.state;
+}
+
+/*
+ * The manual switch, as an ENABLE switch.
+ *
+ * OFF stops the pump at once and suspends automatic operation. The run that was
+ * interrupted is frozen rather than cancelled: we keep how far it had got, so
+ * switching back on finishes the remainder instead of restarting a 5 min 30 s
+ * cycle that was nearly done.
+ *
+ * Overflow never reaches this function - loop() skips it while the 90% float is
+ * wet, deliberately. The switch does not get a vote on water damage.
+ */
+void serviceEnableSwitch(unsigned long now) {
+  if (switchEnabled) {
+    if (state != ST_SWITCH_OFF) return;
+
+    // An auto cycle only resumes if the 70% float is still wet: if it dried
+    // while we were inhibited there is nothing left to pump, and resuming would
+    // run the pump against an empty tray. A manual run was asked for
+    // explicitly, so it owns its own remainder.
+    if (heldState == ST_RUNNING && !reedHigh.state) heldState = ST_IDLE;
+
+    if (heldState != ST_IDLE) {
+      pumpStartMs = now - heldElapsedMs;      // finish the remainder, don't restart
+      state = heldState;
+      setPump(true, heldState == ST_RUNNING ? CAUSE_AUTO : CAUSE_MANUAL);
+      Serial.println("[SWITCH] on - resuming the held run");
+    } else {
+      state = ST_IDLE;
+      Serial.println("[SWITCH] on - automatic operation resumed");
     }
-  } else if (state == ST_MANUAL_SWITCH) {
-    setPump(false, CAUSE_SWITCH);
-    state = ST_IDLE;
-    Serial.println("[MANUAL SWITCH] pump OFF - switch opened");
+    heldState = ST_IDLE;
+    heldElapsedMs = 0;
+    return;
   }
+
+  if (state == ST_SWITCH_OFF) return;
+
+  if (state == ST_RUNNING || state == ST_MANUAL) {
+    const unsigned long elapsed = now - pumpStartMs;
+    heldElapsedMs = (elapsed >= RUN_DURATION_MS) ? RUN_DURATION_MS : elapsed;
+    heldState = state;
+  } else {
+    heldState = ST_IDLE;               // nothing was running, nothing to hold
+    heldElapsedMs = 0;
+  }
+  setPump(false, CAUSE_SWITCH);
+  state = ST_SWITCH_OFF;
+  Serial.println("[SWITCH] off - pump stopped, automatic operation suspended");
 }
 
 void handleAutoCycle(unsigned long now) {
@@ -768,6 +848,13 @@ void setup() {
   reedOverflow.begin(PIN_REED_OVERFLOW);
   switchManual.begin(PIN_SWITCH_MANUAL);
 
+  // Adopt the switch's actual position rather than assuming enabled: booting
+  // with it off must start inhibited, and seeding the edge detector here is
+  // what stops the first loop pass logging a transition that never happened.
+  switchEnabled = switchIsEnabled();
+  state = switchEnabled ? ST_IDLE : ST_SWITCH_OFF;
+  Serial.printf("[SWITCH] %s at boot\n", switchEnabled ? "on" : "off");
+
   secured_client.setInsecure();   // Telegram cert not pinned - keep it simple.
                                   // Set unconditionally so a late WiFi join works.
 
@@ -819,13 +906,23 @@ void loop() {
   reedOverflow.update(now);
   switchManual.update(now);
 
+  // Log the switch on its real edge, even mid-overflow: the position changed
+  // whether or not it is allowed to act on it yet, and a log that only shows
+  // the ones that took effect would be misleading during an overflow.
+  const bool enabledNow = switchIsEnabled();
+  if (enabledNow != switchEnabled) {
+    switchEnabled = enabledNow;
+    logAdd(enabledNow ? EV_SWITCH_ON : EV_SWITCH_OFF, CAUSE_SWITCH);
+  }
+
   server.handleClient();
 
-  // Safety first, and always before anything that can block.
+  // Safety first, and always before anything that can block. Overflow outranks
+  // the switch, so the switch is only serviced once the 90% float is dry.
   handleOverflow(now);
   if (state != ST_OVERFLOW) {
-    handleManualSwitch();
-    handleAutoCycle(now);
+    serviceEnableSwitch(now);
+    if (state != ST_SWITCH_OFF) handleAutoCycle(now);
   }
 
   serviceWifi(now);
