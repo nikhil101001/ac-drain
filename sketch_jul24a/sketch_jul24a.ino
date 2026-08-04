@@ -6,11 +6,11 @@
  *
  *  BEHAVIOUR
  *    Reed HIGH closes (water at 70%)
- *        -> pump runs for 6 minutes, then stops. If the float is still wet,
- *           a fresh 6-minute cycle starts after a short gap (repeats).
+ *        -> pump runs for 5 min 30 s, then stops. If the float is still wet,
+ *           a fresh 5 min 30 s cycle starts after a short gap (repeats).
  *    Reed OVERFLOW closes (water at 90%)
  *        -> pump forced ON to clear it, red LED + buzzer, Telegram alert.
- *           If a full 6-minute run does not drop the level, the pump is
+ *           If a full 5 min 30 s run does not drop the level, the pump is
  *           stopped (it plainly isn't draining) and a "check for a blockage"
  *           alert goes out. Better a wet tray than a burnt-out pump.
  *    Manual rocker switch
@@ -29,7 +29,7 @@
  *    GET  /api/status    JSON status
  *    GET  /api/log       event log, ?since=<seq> for incremental fetch
  *    GET  /api/log.csv   same log as a CSV download
- *    POST /pump/on       manual run, capped at 6 min
+ *    POST /pump/on       manual run, capped at 5 min 30 s
  *    POST /pump/off      stop immediately
  *
  *  TELEGRAM   /status  /log  /pumpon  /pumpoff  /uptime  /help
@@ -84,14 +84,14 @@ const bool RELAY_ACTIVE_LOW = false;
 const uint8_t PUMP_IDLE_LEVEL = RELAY_ACTIVE_LOW ? HIGH : LOW;
 
 const unsigned long LEVEL_DEBOUNCE_MS = 1000;
-const unsigned long RUN_DURATION_MS   = 6UL * 60UL * 1000UL;   // 6 minutes
+const unsigned long RUN_DURATION_MS   = 5UL * 60UL * 1000UL + 30UL * 1000UL;  // 5 min 30 s
 const unsigned long MIN_OFF_MS        = 5UL * 1000UL;          // gap between auto-repeats
 const unsigned long TELEGRAM_POLL_MS  = 2000;
 const unsigned long ALERT_COOLDOWN_MS = 5UL * 60UL * 1000UL;   // don't spam Telegram
 const unsigned long WIFI_RETRY_MS     = 20UL * 1000UL;         // reconnect attempt spacing
-// RUN_DURATION_MS (6 min) is used for every timed pump run - auto cycle,
+// RUN_DURATION_MS (5 min 30 s) is used for every timed pump run - auto cycle,
 // web/Telegram manual, and the overflow guard. It's not a safety margin, it's
-// the actual time to empty a full bucket. Only the manual switch ignores it.
+// the measured time to empty a full bucket. Only the manual switch ignores it.
 
 // ---------------- GLOBALS ----------------
 WebServer server(80);
@@ -451,7 +451,7 @@ void handleTelegramMessages(int numNewMessages) {
         telegramReply(chat_id, msg);
       } else {
         startManualRun();
-        telegramReply(chat_id, "\xF0\x9F\x9F\xA1 <b>Pump started</b>\nManual run, stops after 6 min.");
+        telegramReply(chat_id, "\xF0\x9F\x9F\xA1 <b>Pump started</b>\nManual run, stops after 5 min 30 s.");
       }
 
     } else if (text == "/pumpoff") {
@@ -479,7 +479,7 @@ void handleTelegramMessages(int numNewMessages) {
         "\xF0\x9F\x92\xA7 <b>AC Drain</b>\n"
         "<pre>/status   level, pump, uptime\n"
         "/log      last 8 events\n"
-        "/pumpon   6 min manual run\n"
+        "/pumpon   5m 30s manual run\n"
         "/pumpoff  stop the pump\n"
         "/uptime   how long since boot</pre>\n"
         "Dashboard: http://%s", ipStr);
@@ -584,7 +584,7 @@ void handlePumpOn() {
   const char* why = startBlockedReason();
   if (why) { server.send(409, "text/plain", why); return; }
   startManualRun();
-  server.send(200, "text/plain", "Pump started - 6 minute cap");
+  server.send(200, "text/plain", "Pump started - 5 min 30 s cap");
 }
 
 void handlePumpOff() {
@@ -635,7 +635,7 @@ void handleOverflow(unsigned long now) {
       logAdd(EV_BLOCKED);
       Serial.println("[OVERFLOW] full run done, still wet - pump stopped, needs a look");
       telegramSend("\xF0\x9F\x94\xB4 <b>Not draining</b>\n"
-                   "The pump ran a full 6-minute cycle and the water is still at 90%. "
+                   "The pump ran a full 5 min 30 s cycle and the water is still at 90%. "
                    "Stopped to protect it - check for a blockage now.");
     }
   }
@@ -672,7 +672,7 @@ void handleAutoCycle(unsigned long now) {
         pumpStartMs = now;
         state = ST_RUNNING;
         setPump(true, CAUSE_AUTO);
-        Serial.println("[CYCLE] 70% reached - pump ON for 6 min");
+        Serial.println("[CYCLE] 70% reached - pump ON for 5 min 30 s");
       }
       break;
 
@@ -684,8 +684,8 @@ void handleAutoCycle(unsigned long now) {
         state = ST_IDLE;
         // Still wet? ST_IDLE above starts a fresh cycle once MIN_OFF_MS has
         // passed - that is the "repeat automatically" behaviour.
-        Serial.println(wasAuto ? "[CYCLE] 6 min elapsed - pump OFF"
-                               : "[MANUAL] 6 min cap reached - pump OFF");
+        Serial.println(wasAuto ? "[CYCLE] 5 min 30 s elapsed - pump OFF"
+                               : "[MANUAL] 5 min 30 s cap reached - pump OFF");
       }
       break;
 

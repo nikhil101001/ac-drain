@@ -182,7 +182,7 @@ transform:translate(-50%,160%);transition:transform .3s cubic-bezier(.2,.9,.3,1)
   <div class="note" id="ln"></div>
 
   <footer>
-    Auto cycle: 6 min per run, repeats while the 70% float is wet.<br>
+    Auto cycle: 5 min 30 s per run, repeats while the 70% float is wet.<br>
     <code id="ip">&mdash;</code> &middot; refreshes every 2s
   </footer>
 </main>
@@ -194,7 +194,7 @@ const NAME = ['Idle', 'Auto cycle', 'Manual run', 'Manual switch', 'Overflow'];
 const SUB = [
   'Waiting for the 70% float',
   'Draining on the automatic cycle',
-  'Manual override, 6 minute cap',
+  'Manual override, 5m 30s cap',
   'Rocker switch held closed, no time limit',
   'Water at 90% — clearing it'
 ];
