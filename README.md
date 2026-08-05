@@ -107,6 +107,7 @@ than failing silently.
 | --- | --- |
 | `WIFI_SSID`, `WIFI_PASSWORD` | Required |
 | `BOT_TOKEN`, `CHAT_ID` | Required — from @BotFather and @userinfobot |
+| `WEB_USER`, `WEB_PASSWORD` | Optional on a trusted LAN. **Required** before exposing the dashboard beyond it |
 
 ## Run times
 
@@ -186,6 +187,65 @@ the pump — the same checks the HTTP handlers enforce, so the UI never offers a
 control that the controller would refuse. It states no duration of its own
 either: every run length on the page comes from the device, so retiming the pump
 cannot leave the UI confidently quoting the old number.
+
+### Login
+
+Setting `WEB_USER` and `WEB_PASSWORD` in `secrets.h` puts every route above
+behind HTTP **digest** auth — digest rather than basic, so the password is not
+sent in the clear on each of the ~1800 polls an hour this page makes.
+
+That protects the credential, not the traffic. The page and its JSON are still
+plain HTTP, so encryption has to come from whatever you put in front of it.
+
+Leave both undefined and the dashboard is open, which is a defensible choice on a
+LAN you trust. The boot log says so out loud every time, because it is an easy
+decision to forget you made.
+
+## Reaching it from outside the house
+
+Telegram already works from anywhere and costs nothing to set up — it is an
+outbound connection, so there is no port open and nothing to attack. `/status`,
+`/log`, `/pumpon` and `/pumpoff` cover everything except the run-time card and
+the CSV download. If that is enough, stop here.
+
+For the dashboard itself, put something in front of it. In order of preference:
+
+**1. Tailscale (or any WireGuard VPN).** Best answer if you have anything
+always-on at home — a Pi, a NAS, a mini PC, or a router with Tailscale support.
+Nothing is exposed to the public internet, the traffic is encrypted end to end,
+and the ESP32 needs no changes: it never knows it is happening.
+
+Run it on that machine as a [subnet
+router](https://tailscale.com/kb/1019/subnets) advertising your LAN:
+
+```sh
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up --advertise-routes=192.168.1.0/24 --accept-dns=false
+```
+
+Then approve the route in the Tailscale admin console (Machines → that node →
+Edit route settings), install Tailscale on your phone, and the dashboard answers
+at the controller's LAN address from anywhere.
+
+Give the ESP32 a static DHCP lease on the router first, so the address it
+answers on cannot change under you.
+
+**2. Cloudflare Tunnel.** Also needs a small always-on machine to run
+`cloudflared`, and gives you HTTPS on a real hostname plus [Cloudflare
+Access](https://developers.cloudflare.com/cloudflare-one/policies/access/) in
+front — email or SSO login before anyone reaches the pump. Choose this over
+Tailscale if you want to hand access to someone without installing a VPN on
+their phone. Still no inbound port on your router.
+
+**3. Port-forwarding the ESP32 to the internet. Don't.** It is plain HTTP with a
+mains relay on the end of it, on a device with no security updates and a TCP
+stack sized for a microcontroller. Residential IPs are scanned continuously;
+this would be found in hours. If you take nothing else from this section: not
+this one.
+
+Both real options need a second always-on device on the network, which is not a
+limitation of this project so much as of what an ESP32 can be asked to do
+safely. If you don't have one, Telegram is the honest answer.
 
 ## Event log
 

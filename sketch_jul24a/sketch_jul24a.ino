@@ -30,7 +30,7 @@
  *    Green  - GPIO, lit only while the pump relay is energised.
  *    Red    - GPIO, lit while the 90% overflow float is wet.
  *
- *  WEB
+ *  WEB   (all routes behind digest auth once WEB_PASSWORD is set in secrets.h)
  *    GET  /              dashboard
  *    GET  /api/status    JSON status
  *    GET  /api/log       event log, ?since=<seq> for incremental fetch
@@ -46,6 +46,15 @@
  *
  *  TELEGRAM   /status  /log  /pumpon  /pumpoff  /uptime  /help
  *             (a tap keyboard is attached, so nothing needs typing)
+ *
+ *  REMOTE ACCESS
+ *    Telegram already works from anywhere. For the dashboard, put a VPN or a
+ *    tunnel in front of it - see the README. Do not port-forward this to the
+ *    internet: it is plain HTTP, and on the other end of it is a mains relay.
+ *
+ *  FIRST RUN
+ *    Copy secrets.example.h to secrets.h and fill in your WiFi and Telegram
+ *    details. secrets.h is gitignored so credentials stay off GitHub.
  *
  *  REQUIRED LIBRARIES (Arduino IDE -> Library Manager)
  *    "Universal Telegram Bot" by Brian Lough
@@ -677,11 +686,45 @@ void handleTelegramMessages(int numNewMessages) {
 }
 
 // ---------------- WEB SERVER ----------------
+/*
+ * Authentication.
+ *
+ * On a LAN-only controller this was reasonably skippable. The moment the
+ * dashboard is reachable from outside the house - by tunnel, VPN or anything
+ * else - it stops being skippable: every control this page offers is a pump and
+ * a mains relay, and /api/config can now set how long that relay stays closed.
+ *
+ * Digest rather than Basic, so the password is not sent in the clear on each of
+ * the ~1800 polls an hour this page makes. That protects the credential, not the
+ * traffic: the page and its JSON are still plain HTTP, so the transport itself
+ * has to provide the encryption. Every remote-access route in the README does.
+ *
+ * Defining WEB_PASSWORD switches this on. Left undefined, the dashboard is open
+ * exactly as it was before - fine on a trusted LAN, and the boot log says so
+ * out loud rather than letting it pass unnoticed.
+ */
+#ifdef WEB_PASSWORD
+  #ifndef WEB_USER
+    #define WEB_USER "admin"
+  #endif
+// Returns true when the request has already been answered with a 401, so every
+// handler can start with: if (needsAuth()) return;
+bool needsAuth() {
+  if (server.authenticate(WEB_USER, WEB_PASSWORD)) return false;
+  server.requestAuthentication(DIGEST_AUTH, "AC Drain", "Authentication required");
+  return true;
+}
+#else
+static inline bool needsAuth() { return false; }
+#endif
+
 void handleRoot() {
+  if (needsAuth()) return;
   server.send_P(200, "text/html", INDEX_HTML);
 }
 
 void handleStatus() {
+  if (needsAuth()) return;
   const unsigned long now = millis();
   const unsigned long totalMs = pumpTotalMs + (pumpOn ? now - pumpSinceMs : 0);
 
@@ -731,6 +774,7 @@ void handleStatus() {
  * wire format stays small on a 2-second poll.
  */
 void handleLog() {
+  if (needsAuth()) return;
   uint32_t since = server.hasArg("since")
                  ? strtoul(server.arg("since").c_str(), nullptr, 10) : 0;
   const uint32_t oldest = logOldest();
@@ -762,6 +806,7 @@ void handleLog() {
 
 // GET /api/log.csv - archive the ring off-device before a power cycle clears it.
 void handleLogCsv() {
+  if (needsAuth()) return;
   server.sendHeader("Content-Disposition", "attachment; filename=ac-drain-log.csv");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/csv", "");
@@ -780,6 +825,7 @@ void handleLogCsv() {
 }
 
 void handlePumpOn() {
+  if (needsAuth()) return;
   const char* why = startBlockedReason();
   if (why) { server.send(409, "text/plain", why); return; }
   startManualRun();
@@ -789,6 +835,7 @@ void handlePumpOn() {
 }
 
 void handlePumpOff() {
+  if (needsAuth()) return;
   const char* why = stopBlockedReason();
   if (why) { server.send(409, "text/plain", why); return; }
   setPump(false, CAUSE_MANUAL);
@@ -812,6 +859,7 @@ void handlePumpOff() {
  * anyone is on this endpoint.
  */
 void handleConfig() {
+  if (needsAuth()) return;
   unsigned long runS = runDurationMs / 1000UL;
   unsigned long ovfS = overflowRunMs / 1000UL;
   const bool reset = server.hasArg("reset");
@@ -1132,7 +1180,16 @@ void setup() {
   server.on("/api/config", HTTP_POST, handleConfig);
   server.onNotFound([]() { server.send(404, "text/plain", "not found"); });
   server.begin();
-  Serial.println("[HTTP] dashboard up on port 80");
+#ifdef WEB_PASSWORD
+  Serial.println("[HTTP] dashboard up on port 80 - digest auth as " WEB_USER);
+#else
+  // Said out loud, every boot. An unauthenticated pump control is a defensible
+  // choice on a LAN you trust and an indefensible one the moment anything
+  // tunnels in from outside, and the difference is easy to forget you made.
+  Serial.println("[HTTP] dashboard up on port 80 - NO PASSWORD SET, anyone on this "
+                 "network can run the pump. Set WEB_PASSWORD in secrets.h before "
+                 "exposing it beyond the LAN.");
+#endif
 }
 
 // ---------------- MAIN LOOP ----------------
