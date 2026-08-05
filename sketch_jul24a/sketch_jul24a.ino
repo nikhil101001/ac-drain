@@ -47,14 +47,20 @@
  *  TELEGRAM   /status  /log  /pumpon  /pumpoff  /uptime  /help
  *             (a tap keyboard is attached, so nothing needs typing)
  *
+ *  OTA
+ *    Password-protected over-the-air updates, so the controller can be
+ *    reflashed without unplugging it - "./flash main --ota". See the OTA
+ *    section below for why the pump is parked first and why an update is
+ *    refused mid-overflow.
+ *
  *  REMOTE ACCESS
  *    Telegram already works from anywhere. For the dashboard, put a VPN or a
  *    tunnel in front of it - see the README. Do not port-forward this to the
  *    internet: it is plain HTTP, and on the other end of it is a mains relay.
  *
  *  FIRST RUN
- *    Copy secrets.example.h to secrets.h and fill in your WiFi and Telegram
- *    details. secrets.h is gitignored so credentials stay off GitHub.
+ *    Copy secrets.example.h to secrets.h and fill in your WiFi, Telegram and
+ *    OTA details. secrets.h is gitignored so credentials stay off GitHub.
  *
  *  REQUIRED LIBRARIES (Arduino IDE -> Library Manager)
  *    "Universal Telegram Bot" by Brian Lough
@@ -66,6 +72,8 @@
 #include <WebServer.h>
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
+#include <ArduinoOTA.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <time.h>
 
@@ -78,6 +86,16 @@
   #include "../secrets.h"
 #else
   #error "No secrets.h found. Copy secrets.example.h to secrets.h and fill it in."
+#endif
+
+// An OTA port with no password hands the pump, the relay and the WiFi
+// credentials to anyone on the network, so the build stops rather than quietly
+// opening one. Two lines in secrets.h fixes it - see secrets.example.h.
+#ifndef OTA_PASSWORD
+  #error "No OTA_PASSWORD in secrets.h. Add one (see secrets.example.h) - OTA is not offered unauthenticated."
+#endif
+#ifndef OTA_HOSTNAME
+  #define OTA_HOSTNAME "ac-drain"
 #endif
 
 #include "web_ui.h"
@@ -202,6 +220,7 @@ State state = ST_IDLE;
 bool pumpOn = false;
 bool ledGreenOn = false, ledRedOn = false, buzzerOn = false;
 bool wifiUp = false;
+bool otaReady = false;            // OTA port is listening
 bool overflowMaxRunHit = false;   // a full run didn't clear 90%
 bool overflowAlerted   = false;   // first alert of this overflow already sent
 
@@ -251,10 +270,11 @@ char ipStr[16] = "0.0.0.0";       // cached: building it per request churned the
 // them, so new codes are appended - never inserted.
 enum EvCode : uint8_t {
   EV_BOOT = 0, EV_PUMP_ON, EV_PUMP_OFF, EV_OVERFLOW_ON, EV_OVERFLOW_OFF,
-  EV_BLOCKED, EV_WIFI_DOWN, EV_WIFI_UP, EV_SWITCH_OFF, EV_SWITCH_ON, EV_CONFIG
+  EV_BLOCKED, EV_WIFI_DOWN, EV_WIFI_UP, EV_SWITCH_OFF, EV_SWITCH_ON, EV_OTA,
+  EV_CONFIG
 };
 enum EvCause : uint8_t {
-  CAUSE_NONE = 0, CAUSE_AUTO, CAUSE_MANUAL, CAUSE_SWITCH, CAUSE_OVERFLOW
+  CAUSE_NONE = 0, CAUSE_AUTO, CAUSE_MANUAL, CAUSE_SWITCH, CAUSE_OVERFLOW, CAUSE_OTA
 };
 
 struct LogEvent {
@@ -301,6 +321,7 @@ const char* evName(uint8_t code) {
     case EV_WIFI_UP:      return "wifi_up";
     case EV_SWITCH_OFF:   return "switch_off";
     case EV_SWITCH_ON:    return "switch_on";
+    case EV_OTA:          return "ota";
     case EV_CONFIG:       return "config";
   }
   return "?";
@@ -312,6 +333,7 @@ const char* causeName(uint8_t cause) {
     case CAUSE_MANUAL:   return "manual";
     case CAUSE_SWITCH:   return "switch";
     case CAUSE_OVERFLOW: return "overflow";
+    case CAUSE_OTA:      return "ota";
   }
   return "";
 }
@@ -541,6 +563,7 @@ void evLabelShort(const LogEvent& e, char* out, size_t n) {
     case EV_WIFI_UP:      snprintf(out, n, "wifi back"); break;
     case EV_SWITCH_OFF:   snprintf(out, n, "switch off"); break;
     case EV_SWITCH_ON:    snprintf(out, n, "switch on"); break;
+    case EV_OTA:          snprintf(out, n, "firmware update"); break;
     case EV_CONFIG:
       fmtDur(d, sizeof d, e.detail);
       snprintf(out, n, "run time set to %s", d);
@@ -738,7 +761,11 @@ void handleStatus() {
   // bar is drawn against; "autoDur" and "ovfDur" are the two configured caps
   // and "minDur"/"maxDur" the range the config form may offer, so the page
   // states no duration of its own and cannot fall out of step with the device.
-  char buf[448];
+  //
+  // "host" is width-limited rather than trusted to be short: it comes from
+  // secrets.h, and a long one would truncate the JSON into something the
+  // dashboard could not parse - which would look like the controller dying.
+  char buf[512];
   snprintf(buf, sizeof buf,
     "{\"state\":%u,\"pump\":%s,\"reed70\":%s,\"reed90\":%s,\"manual\":%s,"
     "\"enabled\":%s,"
@@ -746,7 +773,7 @@ void handleStatus() {
     "\"autoDur\":%lu,\"ovfDur\":%lu,\"minDur\":%lu,\"maxDur\":%lu,\"blocked\":%s,"
     "\"starts\":%lu,\"overflows\":%lu,\"blocks\":%lu,"
     "\"pumpTotal\":%lu,\"uptime\":%lu,\"rssi\":%d,\"ip\":\"%s\","
-    "\"seq\":%lu,\"boot\":%lu}",
+    "\"ota\":%s,\"host\":\"%.32s\",\"seq\":%lu,\"boot\":%lu}",
     (unsigned)state, jbool(pumpOn), jbool(reedHigh.state), jbool(reedOverflow.state),
     jbool(switchManual.state), jbool(switchEnabled),
     pumpOn ? (now - pumpSinceMs) / 1000 : 0UL,
@@ -758,6 +785,7 @@ void handleStatus() {
     totalMs / 1000UL, now / 1000UL,
     wifiUp ? WiFi.RSSI() : 0,
     ipStr,
+    jbool(otaReady), OTA_HOSTNAME,
     (unsigned long)logSeq, (unsigned long)bootEpoch);
 
   server.sendHeader("Cache-Control", "no-store");
@@ -1067,6 +1095,7 @@ void serviceWifi(unsigned long now) {
     if (up) {
       cacheIp();
       logAdd(EV_WIFI_UP);
+      beginOta();          // first join, or a router reboot we have come back from
       Serial.printf("[WIFI] connected - http://%s\n", ipStr);
     } else {
       logAdd(EV_WIFI_DOWN);
@@ -1093,6 +1122,92 @@ void serviceTelegram() {
 
   lastTelegramPollMs = millis();   // measured from the end of the poll, so a
                                    // slow TLS handshake can't queue back-to-back
+}
+
+// ---------------- OTA ----------------
+/*
+ * Over-the-air updates, so this can be reflashed from a laptop on the sofa
+ * rather than unplugging the controller and carrying it to a USB cable.
+ *
+ * Three things matter more here than they would on a blinking-LED project:
+ *
+ *  1. THE PUMP IS PARKED BEFORE THE FIRST BYTE LANDS. loop() does not run
+ *     during a transfer, so a relay left closed stays closed for the whole
+ *     upload and the reboot after it - with nothing still running that could
+ *     switch it off if the transfer stalled halfway. onStart() drives the relay
+ *     pin to its idle level directly as well as through setPump(), so it is off
+ *     even if the incoming firmware never boots.
+ *
+ *  2. AN UPDATE IS REFUSED WHILE THE OVERFLOW HANDLER IS PUMPING. That is the
+ *     one moment the pump is the only thing between the tray and the floor, and
+ *     the priority rule that governs everything else here - overflow outranks
+ *     the lot - applies to firmware too. The refusal is simply not servicing the
+ *     OTA port: the sender times out and reports it. Once a blocked overflow has
+ *     stopped the pump the update is allowed again, which is usually the exact
+ *     moment somebody wants to push a fix.
+ *
+ *  3. IT IS PASSWORD PROTECTED, and the build refuses to compile without one.
+ *     An open OTA port on the LAN hands over the pump, the relay and the WiFi
+ *     credentials to anyone who can reach it.
+ *
+ * ArduinoOTA.begin() also brings up mDNS, so the dashboard answers on
+ * http://OTA_HOSTNAME.local once the HTTP service is advertised below - no more
+ * hunting for the address the router handed out this week.
+ */
+void beginOta() {
+  if (otaReady || !wifiUp) return;
+
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+
+  ArduinoOTA.onStart([]() {
+    // Hardware first, bookkeeping second. Everything below this point can be
+    // interrupted by a failed transfer; the relay must not be.
+    setPump(false, CAUSE_OTA);
+    digitalWrite(PIN_PUMP, PUMP_IDLE_LEVEL);
+    writeIfChanged(PIN_LED_RED, ledRedOn, false);
+    writeIfChanged(PIN_BUZZER, buzzerOn, false);
+
+    // Drop any timed run rather than leave a half-elapsed one behind: if the
+    // update fails and loop() resumes, ST_RUNNING with the pump off would sit
+    // out the rest of its cap doing nothing. From ST_IDLE a still-wet float
+    // just starts a fresh cycle, and an off switch re-asserts itself on the
+    // next pass.
+    if (state != ST_OVERFLOW) state = ST_IDLE;
+
+    logAdd(EV_OTA, CAUSE_OTA);
+    Serial.println("\n[OTA] update starting - pump parked, holding the loop");
+  });
+
+  ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    static unsigned int lastPct = 999;
+    const unsigned int pct = total ? (done * 100U) / total : 0;
+    if (pct == lastPct) return;              // one line per percent, not per packet
+    lastPct = pct;
+    Serial.printf("[OTA] %u%%\r", pct);
+  });
+
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\n[OTA] written - rebooting into the new firmware");
+  });
+
+  ArduinoOTA.onError([](ota_error_t err) {
+    // loop() resumes after this, so the controller goes straight back to
+    // watching the floats on the firmware it already had. Nothing to recover.
+    Serial.printf("\n[OTA] failed (error %u) - keeping the current firmware\n", err);
+  });
+
+  ArduinoOTA.begin();
+  MDNS.addService("http", "tcp", 80);        // dashboard on http://OTA_HOSTNAME.local
+  otaReady = true;
+  Serial.printf("[OTA] ready as %s.local - ./flash main --ota\n", OTA_HOSTNAME);
+}
+
+// Overflow outranks a firmware update, so the OTA port goes unserviced while
+// the safety handler is actually driving the pump. Once it has given up and
+// stopped (overflowMaxRunHit) the pump is idle and an update is safe again.
+static inline bool otaAllowed() {
+  return otaReady && !(state == ST_OVERFLOW && !overflowMaxRunHit);
 }
 
 // ---------------- SETUP ----------------
@@ -1163,9 +1278,11 @@ void setup() {
     // UTC only - the dashboard localises. Nothing to misconfigure here.
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     Serial.printf("[WIFI] connected - http://%s\n", ipStr);
-    char msg[160];
+    beginOta();
+    char msg[220];
     snprintf(msg, sizeof msg,
-             "\xE2\x9A\xAA <b>Controller online</b>\nDashboard: http://%s", ipStr);
+             "\xE2\x9A\xAA <b>Controller online</b>\n"
+             "Dashboard: http://%s\nor http://%s.local", ipStr, OTA_HOSTNAME);
     telegramReplyWithMenu(CHAT_ID, msg);   // also installs the tap keyboard
   } else {
     Serial.println("[WIFI] failed - continuing offline, reed/pump logic still works");
@@ -1218,6 +1335,12 @@ void loop() {
     serviceEnableSwitch(now);
     if (state != ST_SWITCH_OFF) handleAutoCycle(now);
   }
+
+  // After the safety logic, so `state` is this pass's answer: an update that
+  // arrives while the overflow handler is driving the pump is left unanswered
+  // until the pump is out of its hands. Once a transfer does start, this call
+  // does not return until the new firmware is written and the board reboots.
+  if (otaAllowed()) ArduinoOTA.handle();
 
   serviceWifi(now);
   serviceTelegram();

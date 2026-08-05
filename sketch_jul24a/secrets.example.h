@@ -9,6 +9,13 @@
 #define BOT_TOKEN     "000000000:XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"   // from @BotFather
 #define CHAT_ID       "000000000"                                        // from @userinfobot
 
+// Over-the-air updates. OTA_PASSWORD is required - the sketch will not compile
+// without it, because an open OTA port hands the pump, the relay and the WiFi
+// credentials to anyone on the network. Pick something long; you type it once,
+// and ./flash --ota reads it from here.
+#define OTA_PASSWORD  "pick-a-long-random-one"
+#define OTA_HOSTNAME  "ac-drain"    // dashboard also answers at ac-drain.local
+
 // Dashboard login. Optional, and optional only because a LAN-only controller
 // can reasonably go without. REQUIRED before you expose it beyond the LAN by
 // any route - every control on that page switches a mains relay. Comment both

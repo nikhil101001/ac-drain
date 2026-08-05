@@ -312,7 +312,7 @@ function render(d) {
   set('tr', dur(d.pumpTotal));
   set('tu', dur(d.uptime));
   $('ts').textContent = d.rssi ? d.rssi + ' dBm' : '';
-  $('ip').textContent = d.ip;
+  $('ip').textContent = d.ip + (d.ota ? ' · ' + d.host + '.local · OTA ready' : '');
   $('fd').textContent =
     'Auto cycle: ' + runlen(d.autoDur) + ' per run, repeats while the 70% float is wet. ' +
     'Overflow runs up to ' + runlen(d.ovfDur) + ' before it is called a blockage.';

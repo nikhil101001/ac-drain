@@ -1,7 +1,7 @@
 # AC Condensate Auto-Drain
 
 ESP32 controller that empties an air-conditioner condensate tray on its own,
-with a web dashboard and Telegram control.
+with a web dashboard, Telegram control and over-the-air updates.
 
 Two reed float switches watch the tray. At **70%** the pump runs a **4 min**
 cycle and repeats while the float stays wet. At **90%** the overflow handler
@@ -107,6 +107,8 @@ than failing silently.
 | --- | --- |
 | `WIFI_SSID`, `WIFI_PASSWORD` | Required |
 | `BOT_TOKEN`, `CHAT_ID` | Required — from @BotFather and @userinfobot |
+| `OTA_PASSWORD` | **Required.** The build fails without it rather than open an unauthenticated OTA port |
+| `OTA_HOSTNAME` | Optional, defaults to `ac-drain` — also the mDNS name |
 | `WEB_USER`, `WEB_PASSWORD` | Optional on a trusted LAN. **Required** before exposing the dashboard beyond it |
 
 ## Run times
@@ -144,6 +146,37 @@ POST /api/config?run=240&overflow=300   # either argument, or both
 POST /api/config?reset=1                # back to the firmware defaults
 ```
 
+## Over-the-air updates
+
+```sh
+./flash main --ota                     # compile and push over WiFi
+./flash main --ota --host 192.168.1.42 # by address when .local won't resolve
+```
+
+No cable, and the board can stay wherever it is mounted. `--ota` reads
+`OTA_PASSWORD` out of `secrets.h`, so there is nothing to type. The default
+ESP32 partition scheme already reserves a second 1.25 MB app slot, so nothing
+needs repartitioning — the current build uses about 87% of one slot.
+
+Three things are worth knowing about how this behaves:
+
+- **The pump is parked before the first byte lands.** `loop()` does not run
+  during a transfer, so a relay left closed would stay closed for the whole
+  upload and the reboot after it — with nothing still running that could switch
+  it off if the transfer stalled. The relay pin is driven to its idle level
+  directly, so the pump is off even if the incoming firmware never boots.
+- **An update is refused while the overflow handler is pumping.** That is the one
+  moment the pump is the only thing between the tray and the floor. The refusal
+  is simply not answering the OTA port, so the upload times out and says so — a
+  timeout during an overflow is the firmware working, not a broken update. Once a
+  blocked overflow has stopped the pump, updates are allowed again.
+- **A failed upload changes nothing.** The board keeps the firmware it had and
+  goes straight back to watching the floats. USB is always there as a fallback.
+
+The controller also answers at **`http://ac-drain.local`** once OTA is up, since
+mDNS comes along with it.
+
+
 ## Flashing
 
 `./flash` wraps compile, upload and monitor. It finds `arduino-cli` inside the
@@ -157,11 +190,13 @@ the USB port and each sketch's baud rate on its own.
 ./flash relay -n     # flash without opening the monitor
 ./flash -m relay     # monitor only
 ./flash -r           # hard reset, restarting whatever is flashed
-./flash -l           # sketches, ports and detected toolchain
+./flash -l           # sketches, ports, OTA host and detected toolchain
+./flash main --ota   # upload over WiFi instead of USB
 ```
 
 Overrides when auto-detection is not what you want: `--port`, `--baud`,
-`--fqbn`, or the `AC_PORT` and `AC_FQBN` environment variables.
+`--fqbn`, `--host`, or the `AC_PORT`, `AC_FQBN` and `AC_OTA_HOST` environment
+variables.
 
 **To watch a sketch boot, press EN on the board with the monitor already open.**
 Opening the monitor does not reset the ESP32, and `-r` has to close the monitor
@@ -227,8 +262,10 @@ Then approve the route in the Tailscale admin console (Machines → that node �
 Edit route settings), install Tailscale on your phone, and the dashboard answers
 at the controller's LAN address from anywhere.
 
-Give the ESP32 a static DHCP lease on the router first, so the address it
-answers on cannot change under you.
+**Use the IP, not `ac-drain.local`, from outside.** mDNS is link-local
+multicast; a subnet router forwards unicast IP traffic and nothing else, so
+`.local` names resolve at home and nowhere else. Give the ESP32 a static DHCP
+lease on the router so the address it answers on cannot change under you.
 
 **2. Cloudflare Tunnel.** Also needs a small always-on machine to run
 `cloudflared`, and gives you HTTPS on a real hostname plus [Cloudflare
@@ -309,8 +346,9 @@ replies need no timezone handling:
 - The page is served from `PROGMEM` and the JSON is built with `snprintf` into a
   fixed buffer, so the 2-second poll loop does not fragment the heap over months
   of uptime.
-- WiFi reconnects on its own. If it never comes back, the reed and pump logic
-  keeps working — the network is only for monitoring and overrides.
+- WiFi reconnects on its own, and OTA comes back up with it. If the network never
+  returns, the reed and pump logic keeps working — WiFi is only for monitoring,
+  overrides and updates.
 - Nothing in the firmware states a run length of its own. Both caps are rendered
   to a string once, wherever they change, and every serial line, Telegram reply,
   HTTP response and dashboard label quotes that — so a retimed pump cannot leave

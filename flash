@@ -12,8 +12,14 @@
 #   ./flash -r              hard reset the board, restarting the sketch
 #   ./flash -l              list sketches, ports and the detected toolchain
 #
+#   ./flash main --ota      upload over WiFi - no cable, board stays where it is
+#   ./flash main --ota --host 192.168.1.42
+#                           same, but by address when .local does not resolve
+#
 # Everything is auto-detected: arduino-cli inside the Arduino IDE bundle, the
 # USB serial port, and each sketch's baud rate read from its Serial.begin call.
+# --ota reads the board's password straight out of secrets.h, so there is
+# nothing to type and nothing to remember.
 #
 # To watch a sketch boot, press the EN button on the board with the monitor
 # already open. Neither -m nor -r can show you boot output: opening the monitor
@@ -30,11 +36,13 @@ cd "$(dirname "$0")"
 
 FQBN="${AC_FQBN:-esp32:esp32:esp32}"
 PORT="${AC_PORT:-}"
+OTA_HOST="${AC_OTA_HOST:-}"
 BAUD=""
 SKETCH=""
 DO_BUILD=1
 DO_MONITOR=1
 DO_RESET=0
+DO_OTA=0
 
 # ---------------- output ----------------
 if [ -t 1 ]; then
@@ -65,6 +73,15 @@ find_cli() {
 find_esptool() {
   # Newest core first, so a version bump does not need editing here.
   ls -1d "$HOME"/Library/Arduino15/packages/esp32/tools/esptool_py/*/esptool 2>/dev/null |
+    sort -V | tail -1
+}
+
+# espota.py ships inside the esp32 core and is what the Arduino IDE itself
+# shells out to for a network upload. Calling it directly beats routing through
+# arduino-cli's port discovery, which has to find the board by mDNS first and
+# gives a much vaguer error when it cannot.
+find_espota() {
+  ls -1 "$HOME"/Library/Arduino15/packages/esp32/hardware/esp32/*/tools/espota.py 2>/dev/null |
     sort -V | tail -1
 }
 
@@ -178,6 +195,19 @@ check_secrets() {
     cp sketch_jul24a/secrets.example.h secrets.h"
 }
 
+# Pull a #define's string value out of whichever secrets.h the sketch would
+# actually compile against - same search order as the sketch's __has_include.
+# Reading it here is the whole reason an OTA upload needs nothing typed.
+secret_value() {
+  local key="$1" sketch="$2" f
+  for f in "$sketch/secrets.h" secrets.h; do
+    [ -f "$f" ] || continue
+    sed -n "s/^[[:space:]]*#[[:space:]]*define[[:space:]]\{1,\}$key[[:space:]]\{1,\}\"\(.*\)\".*/\1/p" "$f" |
+      head -1
+    return
+  done
+}
+
 check_core() {
   local core="${FQBN%%:*}:$(printf '%s' "$FQBN" | cut -d: -f2)"
   "$CLI" core list 2>/dev/null | grep -q "^${core} " && return 0
@@ -198,6 +228,47 @@ do_reset() {
   # read-mac is just a cheap excuse to connect; --after hard-reset does the work.
   "$esptool" --port "$PORT" --after hard-reset --no-stub read-mac >/dev/null 2>&1 ||
     warn "reset did not complete - the board may still have rebooted"
+}
+
+# Compile, then push the image over WiFi. No serial port is touched at all, so
+# the board can stay wherever it is mounted.
+#
+# The controller refuses an update while the 90% overflow handler is driving the
+# pump - it simply stops answering the OTA port - so a timeout during an
+# overflow is the firmware doing its job, not a broken upload.
+do_ota() {
+  local espota out bin pw
+  espota=$(find_espota)
+  [ -n "$espota" ] || die "espota.py not found - install or update the esp32 core"
+  command -v python3 >/dev/null 2>&1 || die "python3 not found - espota.py needs it"
+
+  pw=$(secret_value OTA_PASSWORD "$SKETCH")
+  [ -n "$pw" ] || die "no OTA_PASSWORD in secrets.h - the controller will not accept
+    an unauthenticated update. Add one (see $SKETCH/secrets.example.h) and reflash
+    once over USB so the board knows it."
+
+  if [ -z "$OTA_HOST" ]; then
+    OTA_HOST="$(secret_value OTA_HOSTNAME "$SKETCH")"
+    OTA_HOST="${OTA_HOST:-ac-drain}.local"
+  fi
+
+  # Straight into build/, which is already gitignored.
+  out="build/$SKETCH"
+  say "compiling $SKETCH"
+  "$CLI" compile --fqbn "$FQBN" --output-dir "$out" "$SKETCH" ||
+    die "compile failed - nothing was uploaded"
+
+  bin="$out/$SKETCH.ino.bin"
+  [ -f "$bin" ] || die "no firmware image at $bin"
+
+  say "uploading to $OTA_HOST over the air"
+  python3 "$espota" -i "$OTA_HOST" -p 3232 --auth="$pw" -f "$bin" -r || die "OTA upload failed.
+    - board offline, or $OTA_HOST not resolving? Retry with --host <ip>
+    - refused mid-overflow? The pump has priority; try once it has cleared
+    - authentication failed? OTA_PASSWORD here differs from the one flashed
+    A USB upload always works as a fallback: ./flash $SKETCH"
+
+  printf '%s ok %s %s is running on %s\n' "$G" "$Z" "$SKETCH" "$OTA_HOST"
 }
 
 do_monitor() {
@@ -224,6 +295,11 @@ while [ $# -gt 0 ]; do
     -n|--no-monitor)   DO_MONITOR=0 ;;
     -m|--monitor-only) DO_BUILD=0 ;;
     -r|--reset)        DO_RESET=1; DO_BUILD=0 ;;
+    # An OTA upload never has a serial port to watch, so the monitor is off
+    # rather than left to fail against a board that isn't plugged in.
+    -o|--ota)          DO_OTA=1; DO_MONITOR=0 ;;
+    -H|--host)         shift; [ $# -gt 0 ] || die "--host needs a value"
+                       OTA_HOST="$1"; DO_OTA=1; DO_MONITOR=0 ;;
     -p|--port)         shift; [ $# -gt 0 ] || die "--port needs a value"; PORT="$1" ;;
     -b|--baud)         shift; [ $# -gt 0 ] || die "--baud needs a value"; BAUD="$1" ;;
     -f|--fqbn)         shift; [ $# -gt 0 ] || die "--fqbn needs a value"; FQBN="$1" ;;
@@ -256,11 +332,21 @@ EOF
   if [ -n "$p" ]; then printf '%s\n' "$p" | sed 's/^/  /'; else printf '  none found\n'; fi
   printf '\n%stoolchain%s\n  cli   %s\n  fqbn  %s\n' "$B" "$Z" "$CLI" "$FQBN"
   e=$(find_esptool); printf '  reset %s\n' "${e:-esptool not found}"
+  o=$(find_espota); printf '  ota   %s\n' "${o:-espota.py not found}"
+  h=$(secret_value OTA_HOSTNAME .)
+  printf '  host  %s\n' "${OTA_HOST:-${h:-ac-drain}.local}"
   exit 0
 fi
 
 # ---------------- resolve ----------------
-[ -n "$PORT" ] || PORT=$(find_port)
+# An OTA upload touches no cable, so do not go hunting for a port - and above
+# all do not fail because there isn't one plugged in. That is the entire point.
+if [ "$DO_OTA" = 1 ]; then
+  [ "$DO_BUILD" = 1 ] ||
+    die "--ota uploads over WiFi; -m and -r both need the board on a cable"
+else
+  [ -n "$PORT" ] || PORT=$(find_port)
+fi
 
 # Only a build genuinely needs to know which sketch. Reset and monitor act on
 # the board that is already flashed, so asking there would be a question with
@@ -285,6 +371,13 @@ if [ -z "$BAUD" ]; then
 fi
 
 # ---------------- run ----------------
+if [ "$DO_OTA" = 1 ]; then
+  check_secrets "$SKETCH"
+  check_core
+  do_ota
+  exit 0
+fi
+
 if [ "$DO_BUILD" = 1 ]; then
   check_secrets "$SKETCH"
   check_core
