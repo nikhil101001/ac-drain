@@ -3,18 +3,23 @@
 ESP32 controller that empties an air-conditioner condensate tray on its own,
 with a web dashboard and Telegram control.
 
-Two reed float switches watch the tray. At **70%** the pump runs a **5 min 30 s**
+Two reed float switches watch the tray. At **70%** the pump runs a **4 min**
 cycle and repeats while the float stays wet. At **90%** the overflow handler
 takes over: pump forced on, red LED, beeping buzzer, Telegram alert — and if a
-full 5 min 30 s run does not drop the level, the pump is stopped and flagged as
+full **5 min** run does not drop the level, the pump is stopped and flagged as
 blocked, because at that point it clearly isn't draining and the pump is the
 thing worth protecting.
+
+The overflow run gets the longer cap on purpose. It is a deadline on one
+uninterrupted run rather than a repeating cycle, there is more water to shift at
+90%, and cutting it off at the normal 4 min would report a blockage that is
+really just a bigger job.
 
 The **manual switch is an enable switch, not a run switch.** In its OFF position
 the pump stops immediately and automatic operation is suspended. The run timer is
 *frozen, not reset* — turn the switch back on with a float still wet and the pump
-finishes the remainder of the 5 min 30 s rather than starting over. A 90%
-overflow ignores the switch entirely; water damage outranks it.
+finishes the remainder of the run rather than starting over. A 90% overflow
+ignores the switch entirely; water damage outranks it.
 
 Priority is strict: **overflow > manual switch OFF > web/Telegram manual > auto cycle.**
 
@@ -92,7 +97,12 @@ than failing silently.
    prints on events, so a monitor opened on an idle controller looks dead until
    something happens. The dashboard and Telegram are the primary interfaces.
 
-`secrets.h` is gitignored.
+`secrets.h` is gitignored. What goes in it:
+
+| Define | |
+| --- | --- |
+| `WIFI_SSID`, `WIFI_PASSWORD` | Required |
+| `BOT_TOKEN`, `CHAT_ID` | Required — from @BotFather and @userinfobot |
 
 ## Flashing
 
@@ -127,13 +137,15 @@ can leave the board silent and looking bricked until a clean upload clears it.
 | `GET /api/status` | JSON status |
 | `GET /api/log` | Event log; `?since=<seq>` for an incremental fetch |
 | `GET /api/log.csv` | The same log as a CSV download |
-| `POST /pump/on` | Manual run, capped at 5 min 30 s |
+| `POST /pump/on` | Manual run, capped at the auto-cycle length |
 | `POST /pump/off` | Stop immediately |
 
 The dashboard polls `/api/status` every 2s, pauses while the tab is hidden, and
 disables its buttons whenever the overflow handler or the manual switch owns
 the pump — the same checks the HTTP handlers enforce, so the UI never offers a
-control that the controller would refuse.
+control that the controller would refuse. It states no duration of its own
+either: every run length on the page comes from the device, so retiming the pump
+cannot leave the UI confidently quoting the old number.
 
 ## Event log
 
@@ -175,7 +187,7 @@ nothing needs typing. Messages from any chat other than `CHAT_ID` are ignored.
 Pump     on
 Level    70% draining
 Switch   on (auto)
-Run      4m 12s left
+Run      2m 48s left
 Runs     12, 0 overflow
 Total    2h 38m
 Uptime   6h 05m
@@ -186,7 +198,7 @@ replies need no timezone handling:
 
 ```
 📋 Recent activity
-2m       pump off, 5m 30s run
+2m       pump off, 4m 0s run
 8m       pump on (auto)
 1h 04m   powered on
 ```
@@ -199,3 +211,7 @@ replies need no timezone handling:
   of uptime.
 - WiFi reconnects on its own. If it never comes back, the reed and pump logic
   keeps working — the network is only for monitoring and overrides.
+- Nothing in the firmware states a run length of its own. Both caps are rendered
+  to a string once, wherever they change, and every serial line, Telegram reply,
+  HTTP response and dashboard label quotes that — so a retimed pump cannot leave
+  something behind confidently claiming the old figure.

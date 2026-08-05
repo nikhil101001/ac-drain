@@ -182,7 +182,7 @@ transform:translate(-50%,160%);transition:transform .3s cubic-bezier(.2,.9,.3,1)
   <div class="note" id="ln"></div>
 
   <footer>
-    Auto cycle: 5 min 30 s per run, repeats while the 70% float is wet.<br>
+    <span id="fd">&nbsp;</span><br>
     <code id="ip">&mdash;</code> &middot; refreshes every 2s
   </footer>
 </main>
@@ -194,7 +194,7 @@ const NAME = ['Idle', 'Auto cycle', 'Manual run', 'Switched off', 'Overflow'];
 const SUB = [
   'Waiting for the 70% float',
   'Draining on the automatic cycle',
-  'Manual override, 5m 30s cap',
+  'Manual override',
   'Manual switch is OFF — pump inhibited',
   'Water at 90% — clearing it'
 ];
@@ -211,6 +211,11 @@ function dur(s) {
   return h ? h + 'h ' + m + 'm' : m ? m + 'm ' + (s % 60) + 's' : s % 60 + 's';
 }
 
+// A configured run length rather than a measured one: whole minutes read '4m',
+// not the '4m 0s' dur() would give. The device sends these, so retiming a run
+// updates this page too — nothing here states a duration of its own.
+const runlen = s => s && s % 60 === 0 ? (s / 60 | 0) + 'm' : dur(s);
+
 function set(id, v, cls) { const e = $(id); e.textContent = v; e.className = cls || ''; }
 
 function link(up) {
@@ -222,7 +227,10 @@ function render(d) {
   const s = d.state, locked = s === 3 || s === 4;
   $('hero').className = 'card hero s' + s;
   $('st').textContent = NAME[s] || '?';
-  $('sub').textContent = SUB[s] || '';
+  // A manual run is the one state whose cap is worth spelling out — it is the
+  // only one somebody started by hand and might expect to keep going.
+  $('sub').textContent = (SUB[s] || '') +
+    (s === 2 && d.duration ? ', ' + runlen(d.duration) + ' cap' : '');
 
   // Reeds are the only level information we have, so show what they prove:
   // below 70%, at 70%, or at 90%.
@@ -257,6 +265,9 @@ function render(d) {
   set('tu', dur(d.uptime));
   $('ts').textContent = d.rssi ? d.rssi + ' dBm' : '';
   $('ip').textContent = d.ip;
+  $('fd').textContent =
+    'Auto cycle: ' + runlen(d.autoDur) + ' per run, repeats while the 70% float is wet. ' +
+    'Overflow runs up to ' + runlen(d.ovfDur) + ' before it is called a blockage.';
 
   $('bon').disabled = busy || locked || d.pump;
   $('boff').disabled = busy || locked || !d.pump;
@@ -282,9 +293,10 @@ const EV = [
   ['WiFi lost',              'warn'],   // 6
   ['WiFi restored',          ''    ],   // 7
   ['Manual switch OFF',      'warn'],   // 8
-  ['Manual switch ON',       ''    ]    // 9
+  ['Manual switch ON',       ''    ],   // 9
+  ['Firmware update',        'warn']    // 10
 ];
-const CAUSE = ['', 'auto cycle', 'manual', 'manual switch', 'overflow'];
+const CAUSE = ['', 'auto cycle', 'manual', 'manual switch', 'overflow', 'firmware update'];
 
 let evs = [], lastSeq = 0, bootEpoch = 0, lostOld = false;
 
@@ -396,6 +408,7 @@ async function cmd(path) {
 
 $('bon').onclick = () => cmd('/pump/on');
 $('boff').onclick = () => cmd('/pump/off');
+
 document.addEventListener('visibilitychange', poll);
 poll();
 setInterval(poll, 2000);

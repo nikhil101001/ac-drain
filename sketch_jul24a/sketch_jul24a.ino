@@ -6,18 +6,20 @@
  *
  *  BEHAVIOUR
  *    Reed HIGH closes (water at 70%)
- *        -> pump runs for 5 min 30 s, then stops. If the float is still wet,
- *           a fresh 5 min 30 s cycle starts after a short gap (repeats).
+ *        -> pump runs for 4 min, then stops. If the float is still wet, a fresh
+ *           4 min cycle starts after a short gap (repeats).
  *    Reed OVERFLOW closes (water at 90%)
- *        -> pump forced ON to clear it, red LED + buzzer, Telegram alert.
- *           If a full 5 min 30 s run does not drop the level, the pump is
- *           stopped (it plainly isn't draining) and a "check for a blockage"
- *           alert goes out. Better a wet tray than a burnt-out pump.
+ *        -> pump forced ON to clear it, red LED + buzzer, Telegram alert. The
+ *           overflow run gets a LONGER cap than the normal cycle - 5 min - on
+ *           the grounds that there is more water to shift. If that full run
+ *           does not drop the level, the pump is stopped (it plainly isn't
+ *           draining) and a "check for a blockage" alert goes out. Better a wet
+ *           tray than a burnt-out pump.
  *    Manual switch  -  an ENABLE switch, not a run switch
  *        -> OFF stops the pump at once and suspends automatic operation. The
  *           run timer is FROZEN, not reset: switch back on with a float still
- *           wet and the pump finishes the remainder of the 5 min 30 s rather
- *           than starting the cycle over. A 90% overflow ignores the switch
+ *           wet and the pump finishes the remainder of the 4 min rather than
+ *           starting the cycle over. A 90% overflow ignores the switch
  *           entirely - water damage outranks it.
  *
  *  PRIORITY   overflow > manual switch OFF > web/Telegram manual > auto cycle
@@ -33,15 +35,11 @@
  *    GET  /api/status    JSON status
  *    GET  /api/log       event log, ?since=<seq> for incremental fetch
  *    GET  /api/log.csv   same log as a CSV download
- *    POST /pump/on       manual run, capped at 5 min 30 s
+ *    POST /pump/on       manual run, capped at the normal cycle length
  *    POST /pump/off      stop immediately
  *
  *  TELEGRAM   /status  /log  /pumpon  /pumpoff  /uptime  /help
  *             (a tap keyboard is attached, so nothing needs typing)
- *
- *  FIRST RUN
- *    Copy secrets.example.h to secrets.h and fill in your WiFi and Telegram
- *    details. secrets.h is gitignored so credentials stay off GitHub.
  *
  *  REQUIRED LIBRARIES (Arduino IDE -> Library Manager)
  *    "Universal Telegram Bot" by Brian Lough
@@ -101,14 +99,31 @@ const bool BUZZER_BOOT_TEST    = true;
 const unsigned long BUZZER_BOOT_TEST_MS = 250;
 
 const unsigned long LEVEL_DEBOUNCE_MS = 1000;
-const unsigned long RUN_DURATION_MS   = 5UL * 60UL * 1000UL + 30UL * 1000UL;  // 5 min 30 s
 const unsigned long MIN_OFF_MS        = 5UL * 1000UL;          // gap between auto-repeats
 const unsigned long TELEGRAM_POLL_MS  = 2000;
 const unsigned long ALERT_COOLDOWN_MS = 5UL * 60UL * 1000UL;   // don't spam Telegram
 const unsigned long WIFI_RETRY_MS     = 20UL * 1000UL;         // reconnect attempt spacing
-// RUN_DURATION_MS (5 min 30 s) is used for every timed pump run - auto cycle,
-// web/Telegram manual, and the overflow guard. It's not a safety margin, it's
-// the measured time to empty a full bucket.
+
+// ---------------- RUN CAPS ----------------
+/*
+ * Two caps, because the two situations are not the same job.
+ *
+ * The RUN cap covers every ordinary timed run - the auto cycle and any
+ * web/Telegram manual run. MIN_OFF_MS then lets a still-wet float start the
+ * next one, so a tray that needs longer gets more cycles rather than one long
+ * run; the cap is what stops the pump running dry against an empty tray.
+ *
+ * The OVERFLOW cap is longer only because it is the deadline on a single
+ * uninterrupted run: at 90% there is more water to shift, and stopping at the
+ * normal cap would declare a blockage that isn't one. Passing it is the signal
+ * that the pump has had a fair go and still isn't draining.
+ *
+ * Both are per-run caps, not safety margins. Retime them if the bucket or the
+ * pump changes; every message, reply and dashboard label reads these numbers
+ * rather than a hardcoded string, so nothing is left claiming the old figure.
+ */
+const unsigned long runDurationMs = 4UL * 60UL * 1000UL;   // 4 min - normal cycle
+const unsigned long overflowRunMs = 5UL * 60UL * 1000UL;   // 5 min - overflow guard
 
 // ---------------- GLOBALS ----------------
 WebServer server(80);
@@ -148,11 +163,17 @@ bool wifiUp = false;
 bool overflowMaxRunHit = false;   // a full run didn't clear 90%
 bool overflowAlerted   = false;   // first alert of this overflow already sent
 
+// The two run caps rendered once at boot ("4m", "5m"). Every message, reply and
+// dashboard label quotes these instead of a literal, so retiming a run cannot
+// leave the UI confidently stating a number the pump no longer uses.
+char runDurStr[12] = "";
+char ovfDurStr[12] = "";
+
 // Enable-switch state, and the timed run it interrupted.
 //
 // Freezing is the whole point of holding these: when the switch goes off
 // mid-cycle we keep how far the run had got, so flipping it back on finishes
-// the remainder instead of restarting a 5 min 30 s run that was nearly done.
+// the remainder instead of restarting a full run that was nearly done.
 // heldState is ST_IDLE when there is nothing to resume.
 bool switchEnabled  = true;       // debounced + polarity-corrected
 State heldState     = ST_IDLE;    // ST_RUNNING or ST_MANUAL if a run was frozen
@@ -287,6 +308,16 @@ void fmtDur(char* out, size_t n, unsigned long secs) {
   else        snprintf(out, n, "%lus", s);
 }
 
+// Same idea, but for quoting a configured run length rather than a measured
+// one: a whole number of minutes reads "4m", not the "4m 0s" that fmtDur would
+// give. Measured durations keep the trailing seconds - they are real.
+void fmtRunLen(char* out, size_t n, unsigned long secs) {
+  const unsigned long m = secs / 60, s = secs % 60;
+  if (m && s) snprintf(out, n, "%lum %lus", m, s);
+  else if (m) snprintf(out, n, "%lum", m);
+  else        snprintf(out, n, "%lus", s);
+}
+
 const char* stateName() {
   switch (state) {
     case ST_IDLE:       return "Idle";
@@ -309,6 +340,13 @@ const char* stateGlyph() {
   return "\xE2\x9A\xAA";
 }
 
+// The cap that applies to whatever run is in progress. Only an overflow gets
+// the longer one - a run frozen by the switch is an ordinary cycle held
+// mid-flight, so it finishes against the ordinary cap.
+static inline unsigned long currentCapMs() {
+  return (state == ST_OVERFLOW) ? overflowRunMs : runDurationMs;
+}
+
 // Seconds left in the current timed run, or -1 when nothing is timed.
 //
 // A run frozen by the enable switch still reports its remainder: that is what
@@ -320,7 +358,8 @@ long remainingSecs(unsigned long now) {
   else if (state == ST_OVERFLOW && !overflowMaxRunHit)      elapsed = elapsedSince(now, overflowStartMs);
   else if (state == ST_SWITCH_OFF && heldState != ST_IDLE)  elapsed = heldElapsedMs;
   else                                                      return -1;
-  return elapsed >= RUN_DURATION_MS ? 0 : (long)((RUN_DURATION_MS - elapsed) / 1000);
+  const unsigned long cap = currentCapMs();
+  return elapsed >= cap ? 0 : (long)((cap - elapsed) / 1000);
 }
 
 // ---------------- PUMP / INDICATORS ----------------
@@ -508,7 +547,10 @@ void handleTelegramMessages(int numNewMessages) {
         telegramReply(chat_id, msg);
       } else {
         startManualRun();
-        telegramReply(chat_id, "\xF0\x9F\x9F\xA1 <b>Pump started</b>\nManual run, stops after 5 min 30 s.");
+        char msg[96];
+        snprintf(msg, sizeof msg,
+                 "\xF0\x9F\x9F\xA1 <b>Pump started</b>\nManual run, stops after %s.", runDurStr);
+        telegramReply(chat_id, msg);
       }
 
     } else if (text == "/pumpoff") {
@@ -531,15 +573,15 @@ void handleTelegramMessages(int numNewMessages) {
       telegramReply(chat_id, msg);
 
     } else {
-      char msg[260];
+      char msg[300];
       snprintf(msg, sizeof msg,
         "\xF0\x9F\x92\xA7 <b>AC Drain</b>\n"
         "<pre>/status   level, pump, uptime\n"
         "/log      last 8 events\n"
-        "/pumpon   5m 30s manual run\n"
+        "/pumpon   %s manual run\n"
         "/pumpoff  stop the pump\n"
         "/uptime   how long since boot</pre>\n"
-        "Dashboard: http://%s", ipStr);
+        "Dashboard: http://%s", runDurStr, ipStr);
       telegramReplyWithMenu(chat_id, msg);
     }
   }
@@ -559,11 +601,17 @@ void handleStatus() {
   // "manual" is the raw contact position; "enabled" is that with the polarity
   // flag applied, which is the one the dashboard shows - so a flipped
   // SWITCH_CLOSED_IS_ENABLED never leaves the panel disagreeing with the pump.
-  char buf[368];
+  //
+  // "duration" is the cap on the run in progress, which is what the progress
+  // bar is drawn against; "autoDur" and "ovfDur" are the two configured caps,
+  // so the page states no duration of its own and cannot fall out of step with
+  // the device.
+  char buf[448];
   snprintf(buf, sizeof buf,
     "{\"state\":%u,\"pump\":%s,\"reed70\":%s,\"reed90\":%s,\"manual\":%s,"
     "\"enabled\":%s,"
-    "\"elapsed\":%lu,\"remaining\":%ld,\"duration\":%lu,\"blocked\":%s,"
+    "\"elapsed\":%lu,\"remaining\":%ld,\"duration\":%lu,"
+    "\"autoDur\":%lu,\"ovfDur\":%lu,\"blocked\":%s,"
     "\"starts\":%lu,\"overflows\":%lu,\"blocks\":%lu,"
     "\"pumpTotal\":%lu,\"uptime\":%lu,\"rssi\":%d,\"ip\":\"%s\","
     "\"seq\":%lu,\"boot\":%lu}",
@@ -571,7 +619,8 @@ void handleStatus() {
     jbool(switchManual.state), jbool(switchEnabled),
     pumpOn ? (now - pumpSinceMs) / 1000 : 0UL,
     remainingSecs(now),
-    RUN_DURATION_MS / 1000UL,
+    currentCapMs() / 1000UL,
+    runDurationMs / 1000UL, overflowRunMs / 1000UL,
     jbool(overflowMaxRunHit),
     pumpStarts, overflowCount, blockedCount,
     totalMs / 1000UL, now / 1000UL,
@@ -645,7 +694,9 @@ void handlePumpOn() {
   const char* why = startBlockedReason();
   if (why) { server.send(409, "text/plain", why); return; }
   startManualRun();
-  server.send(200, "text/plain", "Pump started - 5 min 30 s cap");
+  char msg[48];
+  snprintf(msg, sizeof msg, "Pump started - %s cap", runDurStr);
+  server.send(200, "text/plain", msg);
 }
 
 void handlePumpOff() {
@@ -687,17 +738,23 @@ void handleOverflow(unsigned long now) {
   writeIfChanged(PIN_LED_RED, ledRedOn, true);
   writeIfChanged(PIN_BUZZER, buzzerOn, true);
 
+  // The overflow run gets its own, longer cap: there is more water to shift at
+  // 90% than the normal cycle is timed for, and cutting it off at 4 min would
+  // report a blockage that is really just a bigger job.
   if (!overflowMaxRunHit) {
     setPump(true, CAUSE_OVERFLOW);
-    if (now - overflowStartMs >= RUN_DURATION_MS) {
+    if (elapsedSince(now, overflowStartMs) >= overflowRunMs) {
       overflowMaxRunHit = true;
       setPump(false, CAUSE_OVERFLOW);
       blockedCount++;
       logAdd(EV_BLOCKED);
       Serial.println("[OVERFLOW] full run done, still wet - pump stopped, needs a look");
-      telegramSend("\xF0\x9F\x94\xB4 <b>Not draining</b>\n"
-                   "The pump ran a full 5 min 30 s cycle and the water is still at 90%. "
-                   "Stopped to protect it - check for a blockage now.");
+      char msg[200];
+      snprintf(msg, sizeof msg,
+               "\xF0\x9F\x94\xB4 <b>Not draining</b>\n"
+               "The pump ran a full %s and the water is still at 90%%. "
+               "Stopped to protect it - check for a blockage now.", ovfDurStr);
+      telegramSend(msg);
     }
   }
 
@@ -723,8 +780,8 @@ static inline bool switchIsEnabled() {
  *
  * OFF stops the pump at once and suspends automatic operation. The run that was
  * interrupted is frozen rather than cancelled: we keep how far it had got, so
- * switching back on finishes the remainder instead of restarting a 5 min 30 s
- * cycle that was nearly done.
+ * switching back on finishes the remainder instead of restarting a cycle that
+ * was nearly done.
  *
  * Overflow never reaches this function - loop() skips it while the 90% float is
  * wet, deliberately. The switch does not get a vote on water damage.
@@ -757,7 +814,7 @@ void serviceEnableSwitch(unsigned long now) {
 
   if (state == ST_RUNNING || state == ST_MANUAL) {
     const unsigned long elapsed = elapsedSince(now, pumpStartMs);
-    heldElapsedMs = (elapsed >= RUN_DURATION_MS) ? RUN_DURATION_MS : elapsed;
+    heldElapsedMs = (elapsed >= runDurationMs) ? runDurationMs : elapsed;
     heldState = state;
   } else {
     heldState = ST_IDLE;               // nothing was running, nothing to hold
@@ -775,20 +832,20 @@ void handleAutoCycle(unsigned long now) {
         pumpStartMs = now;
         state = ST_RUNNING;
         setPump(true, CAUSE_AUTO);
-        Serial.println("[CYCLE] 70% reached - pump ON for 5 min 30 s");
+        Serial.printf("[CYCLE] 70%% reached - pump ON for %s\n", runDurStr);
       }
       break;
 
     case ST_RUNNING:
     case ST_MANUAL:
-      if (elapsedSince(now, pumpStartMs) >= RUN_DURATION_MS) {
+      if (elapsedSince(now, pumpStartMs) >= runDurationMs) {
         const bool wasAuto = (state == ST_RUNNING);
         setPump(false, wasAuto ? CAUSE_AUTO : CAUSE_MANUAL);
         state = ST_IDLE;
         // Still wet? ST_IDLE above starts a fresh cycle once MIN_OFF_MS has
         // passed - that is the "repeat automatically" behaviour.
-        Serial.println(wasAuto ? "[CYCLE] 5 min 30 s elapsed - pump OFF"
-                               : "[MANUAL] 5 min 30 s cap reached - pump OFF");
+        Serial.printf(wasAuto ? "[CYCLE] %s elapsed - pump OFF\n"
+                              : "[MANUAL] %s cap reached - pump OFF\n", runDurStr);
       }
       break;
 
@@ -860,7 +917,14 @@ void setup() {
 
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n[BOOT] AC drain controller");
+
+  // Render the run caps once, here, so every later message can quote them by
+  // pointer rather than by literal.
+  fmtRunLen(runDurStr, sizeof runDurStr, runDurationMs / 1000UL);
+  fmtRunLen(ovfDurStr, sizeof ovfDurStr, overflowRunMs / 1000UL);
+
+  Serial.printf("\n[BOOT] AC drain controller - %s cycle, %s overflow cap\n",
+                runDurStr, ovfDurStr);
   logAdd(EV_BOOT);
 
   pinMode(PIN_LED_GREEN, OUTPUT); digitalWrite(PIN_LED_GREEN, LOW);
