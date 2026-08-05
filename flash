@@ -15,6 +15,8 @@
 #   ./flash main --ota      upload over WiFi - no cable, board stays where it is
 #   ./flash main --ota --host 192.168.1.42
 #                           same, but by address when .local does not resolve
+#   ./flash main --build    compile only, then print the .bin to drag into the
+#                           dashboard's Firmware card
 #
 # Everything is auto-detected: arduino-cli inside the Arduino IDE bundle, the
 # USB serial port, and each sketch's baud rate read from its Serial.begin call.
@@ -43,6 +45,7 @@ DO_BUILD=1
 DO_MONITOR=1
 DO_RESET=0
 DO_OTA=0
+DO_BUILD_ONLY=0
 
 # ---------------- output ----------------
 if [ -t 1 ]; then
@@ -230,6 +233,22 @@ do_reset() {
     warn "reset did not complete - the board may still have rebooted"
 }
 
+# Compile to build/, which is already gitignored, and echo the image path.
+# Shared by the two ways an image leaves this machine without a cable: pushed by
+# espota, or picked up by hand and dropped into the dashboard.
+#
+# Progress goes to stderr so stdout carries the path and nothing else - this is
+# called in a $( ) substitution.
+build_image() {
+  local out="build/$SKETCH" bin
+  say "compiling $SKETCH" >&2
+  "$CLI" compile --fqbn "$FQBN" --output-dir "$out" "$SKETCH" >&2 ||
+    die "compile failed - nothing was uploaded"
+  bin="$out/$SKETCH.ino.bin"
+  [ -f "$bin" ] || die "no firmware image at $bin"
+  printf '%s\n' "$bin"
+}
+
 # Compile, then push the image over WiFi. No serial port is touched at all, so
 # the board can stay wherever it is mounted.
 #
@@ -237,7 +256,7 @@ do_reset() {
 # pump - it simply stops answering the OTA port - so a timeout during an
 # overflow is the firmware doing its job, not a broken upload.
 do_ota() {
-  local espota out bin pw
+  local espota bin pw
   espota=$(find_espota)
   [ -n "$espota" ] || die "espota.py not found - install or update the esp32 core"
   command -v python3 >/dev/null 2>&1 || die "python3 not found - espota.py needs it"
@@ -252,14 +271,7 @@ do_ota() {
     OTA_HOST="${OTA_HOST:-ac-drain}.local"
   fi
 
-  # Straight into build/, which is already gitignored.
-  out="build/$SKETCH"
-  say "compiling $SKETCH"
-  "$CLI" compile --fqbn "$FQBN" --output-dir "$out" "$SKETCH" ||
-    die "compile failed - nothing was uploaded"
-
-  bin="$out/$SKETCH.ino.bin"
-  [ -f "$bin" ] || die "no firmware image at $bin"
+  bin=$(build_image)
 
   say "uploading to $OTA_HOST over the air"
   python3 "$espota" -i "$OTA_HOST" -p 3232 --auth="$pw" -f "$bin" -r || die "OTA upload failed.
@@ -298,6 +310,7 @@ while [ $# -gt 0 ]; do
     # An OTA upload never has a serial port to watch, so the monitor is off
     # rather than left to fail against a board that isn't plugged in.
     -o|--ota)          DO_OTA=1; DO_MONITOR=0 ;;
+    -c|--build)        DO_BUILD_ONLY=1; DO_MONITOR=0 ;;
     -H|--host)         shift; [ $# -gt 0 ] || die "--host needs a value"
                        OTA_HOST="$1"; DO_OTA=1; DO_MONITOR=0 ;;
     -p|--port)         shift; [ $# -gt 0 ] || die "--port needs a value"; PORT="$1" ;;
@@ -339,11 +352,12 @@ EOF
 fi
 
 # ---------------- resolve ----------------
-# An OTA upload touches no cable, so do not go hunting for a port - and above
-# all do not fail because there isn't one plugged in. That is the entire point.
-if [ "$DO_OTA" = 1 ]; then
+# Neither --ota nor --build touches a cable, so do not go hunting for a port -
+# and above all do not fail because there isn't one plugged in. That is the
+# entire point of both of them.
+if [ "$DO_OTA" = 1 ] || [ "$DO_BUILD_ONLY" = 1 ]; then
   [ "$DO_BUILD" = 1 ] ||
-    die "--ota uploads over WiFi; -m and -r both need the board on a cable"
+    die "--ota and --build do not use the cable; -m and -r both need it"
 else
   [ -n "$PORT" ] || PORT=$(find_port)
 fi
@@ -371,6 +385,15 @@ if [ -z "$BAUD" ]; then
 fi
 
 # ---------------- run ----------------
+if [ "$DO_BUILD_ONLY" = 1 ]; then
+  check_secrets "$SKETCH"
+  check_core
+  BIN=$(build_image)
+  printf '%s ok %s %s\n' "$G" "$Z" "$BIN"
+  printf '   upload it from the dashboard: Firmware > choose file > upload\n'
+  exit 0
+fi
+
 if [ "$DO_OTA" = 1 ]; then
   check_secrets "$SKETCH"
   check_core

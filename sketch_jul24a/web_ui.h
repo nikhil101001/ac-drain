@@ -118,7 +118,15 @@ border:1px solid var(--line);border-radius:10px;appearance:textfield;-moz-appear
 .fr .eq{display:block;margin-top:5px;font-style:normal;font-size:11px;line-height:1.4;
 color:var(--dim);white-space:nowrap}
 .fr .eq.bad{color:var(--bad)}
+/* The file input gets its own line: a native file control is as wide as its
+   filename, so sharing a row with the label truncated both. */
+.fr.col{display:block}
+.fr.col input{width:100%;margin-top:9px;padding:8px;text-align:left;font-size:12px}
+.fr input[type=file]::file-selector-button{margin-right:9px;padding:6px 10px;border-radius:8px;
+border:1px solid var(--line);background:var(--card);color:var(--tx);font:inherit;font-size:12px;cursor:pointer}
 .cfg button{width:100%;margin-top:12px}
+.cfg .bar{margin-top:12px}
+.cfg i code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px}
 
 .sec{margin-top:20px;display:flex;align-items:baseline;justify-content:space-between;gap:10px}
 .sec h2{margin:0;font-weight:600;font-size:11px;line-height:1.4;letter-spacing:1px;text-transform:uppercase;color:var(--dim)}
@@ -223,6 +231,25 @@ transform:translate(-50%,160%);transition:transform .3s cubic-bezier(.2,.9,.3,1)
   <div class="note" id="cn"></div>
 
   <div class="sec">
+    <h2>Firmware</h2>
+  </div>
+  <section class="card cfg">
+    <div class="fr col">
+      <div>
+        <label for="fw">Firmware image</label>
+        <i>The <code>.ino.bin</code> from <code>./flash main --build</code></i>
+      </div>
+      <input id="fw" type="file" accept=".bin">
+    </div>
+    <div class="bar hide" id="uw"><i id="ub"></i></div>
+    <button id="usend" disabled>Upload and restart</button>
+  </section>
+  <div class="note" id="un">
+    The pump is stopped before the write begins, and the controller restarts on
+    its own. An upload is refused while the 90% float is wet.
+  </div>
+
+  <div class="sec">
     <h2>Activity log</h2>
     <a href="/api/log.csv" download>Download CSV</a>
   </div>
@@ -251,7 +278,7 @@ const LOCK = [
   'Controls are locked — the manual switch is in the OFF position.',
   'Controls are locked — the overflow safety handler owns the pump.'
 ];
-let fails = 0, busy = false;
+let fails = 0, busy = false, uploading = false;
 
 function dur(s) {
   s = s > 0 ? s | 0 : 0;
@@ -492,7 +519,8 @@ async function pollLog() {
 }
 
 async function poll() {
-  if (document.hidden) return;               // don't wake the ESP32 for a hidden tab
+  if (document.hidden || uploading) return;  // don't wake the ESP32 for a hidden
+                                             // tab, or interrupt a flash write
   try {
     const r = await fetch('/api/status', { cache: 'no-store' });
     if (!r.ok) throw 0;
@@ -527,6 +555,59 @@ async function cmd(path) {
   busy = false;
   poll();
 }
+
+/*
+ * Firmware upload.
+ *
+ * XHR rather than fetch: fetch reports nothing about upload progress, and a
+ * ~1.1 MB image over WiFi to an ESP32 takes long enough that a page with no bar
+ * looks hung — which invites exactly the reload that would abort it.
+ *
+ * The status poll is suspended for the duration. The controller is
+ * single-threaded and busy writing flash; polling it every 2 seconds through
+ * that would achieve nothing but competing with the upload for the socket.
+ */
+function upEnd(msg, ok) {
+  uploading = false;
+  $('uw').className = 'bar hide';
+  $('usend').disabled = !$('fw').files.length;
+  toast(msg);
+  // On success the board is rebooting: it will not answer for a few seconds, so
+  // say so rather than letting the connection dot flick to red unexplained.
+  $('un').textContent = ok
+    ? 'Restarting into the new firmware — this page will reconnect on its own.'
+    : 'The controller kept the firmware it had. Nothing was changed.';
+}
+
+$('usend').onclick = () => {
+  const f = $('fw').files[0];
+  if (!f || uploading) return;
+  if (!confirm('Upload ' + f.name + '?\n\nThe pump stops and the controller '
+             + 'restarts. It cannot do either while the 90% float is wet.')) return;
+
+  uploading = true;
+  $('usend').disabled = true;
+  $('uw').className = 'bar';
+  $('ub').style.width = '0%';
+
+  const fd = new FormData();
+  fd.append('firmware', f, f.name);
+  const x = new XMLHttpRequest();
+
+  x.upload.onprogress = e => {
+    if (e.lengthComputable) $('ub').style.width = (100 * e.loaded / e.total) + '%';
+  };
+  x.onload = () => upEnd(x.responseText || (x.status === 200 ? 'Done' : 'Failed'),
+                         x.status === 200);
+  // The board can reset the connection as it restarts, which arrives here as an
+  // error even though the write succeeded — so this says what it knows, no more.
+  x.onerror = () => upEnd('Connection lost during upload — check whether the '
+                        + 'controller came back before retrying.', false);
+  x.open('POST', '/api/update');
+  x.send(fd);
+};
+
+$('fw').onchange = () => { $('usend').disabled = !$('fw').files.length || uploading; };
 
 $('bon').onclick = () => cmd('/pump/on');
 $('boff').onclick = () => cmd('/pump/off');

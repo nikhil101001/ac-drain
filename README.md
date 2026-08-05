@@ -148,17 +148,30 @@ POST /api/config?reset=1                # back to the firmware defaults
 
 ## Over-the-air updates
 
+Two ways in, neither needing a cable. Both are password-protected, and both go
+through the same safety checks below.
+
+**From the dashboard** — the Firmware card takes a `.bin` and shows a progress
+bar, so an update needs nothing installed on the machine doing it. A phone is
+enough.
+
+```sh
+./flash main --build   # compile only; prints the .bin to upload
+```
+
+**From the command line** — one step instead of two, when you are already at a
+terminal with the toolchain.
+
 ```sh
 ./flash main --ota                     # compile and push over WiFi
 ./flash main --ota --host 192.168.1.42 # by address when .local won't resolve
 ```
 
-No cable, and the board can stay wherever it is mounted. `--ota` reads
-`OTA_PASSWORD` out of `secrets.h`, so there is nothing to type. The default
-ESP32 partition scheme already reserves a second 1.25 MB app slot, so nothing
-needs repartitioning — the current build uses about 87% of one slot.
+`--ota` reads `OTA_PASSWORD` out of `secrets.h`, so there is nothing to type.
+The default ESP32 partition scheme already reserves a second 1.25 MB app slot,
+so nothing needs repartitioning — the current build uses about 88% of one slot.
 
-Three things are worth knowing about how this behaves:
+Three things are worth knowing about how both of these behave:
 
 - **The pump is parked before the first byte lands.** `loop()` does not run
   during a transfer, so a relay left closed would stay closed for the whole
@@ -170,12 +183,21 @@ Three things are worth knowing about how this behaves:
   is simply not answering the OTA port, so the upload times out and says so — a
   timeout during an overflow is the firmware working, not a broken update. Once a
   blocked overflow has stopped the pump, updates are allowed again.
-- **A failed upload changes nothing.** The board keeps the firmware it had and
-  goes straight back to watching the floats. USB is always there as a fallback.
+- **A failed upload changes nothing.** A half-written image lands in the
+  *inactive* partition, so the running firmware is untouched — the board keeps
+  what it had and goes straight back to watching the floats. USB is always there
+  as a fallback.
 
 The controller also answers at **`http://ac-drain.local`** once OTA is up, since
 mDNS comes along with it.
 
+A note on the browser upload specifically: `WebServer` hands the request body to
+its upload callback *before* the handler that sends the response, so the login
+is checked at the first chunk rather than at the end — otherwise an
+unauthenticated image would already be in flash by the time it was refused.
+There is no way to reject a body mid-flight, so a rejected upload is received
+and discarded rather than written. It wastes bandwidth; it does not touch the
+partition.
 
 ## Flashing
 
@@ -192,6 +214,7 @@ the USB port and each sketch's baud rate on its own.
 ./flash -r           # hard reset, restarting whatever is flashed
 ./flash -l           # sketches, ports, OTA host and detected toolchain
 ./flash main --ota   # upload over WiFi instead of USB
+./flash main --build # compile only, print the .bin for the dashboard upload
 ```
 
 Overrides when auto-detection is not what you want: `--port`, `--baud`,
@@ -215,6 +238,7 @@ can leave the board silent and looking bricked until a clean upload clears it.
 | `POST /pump/on` | Manual run, capped at the auto-cycle length |
 | `POST /pump/off` | Stop immediately |
 | `POST /api/config` | Set the run caps — `?run=<sec>&overflow=<sec>`, or `?reset=1` |
+| `POST /api/update` | Firmware upload, `multipart/form-data` with one `.bin` |
 
 The dashboard polls `/api/status` every 2s, pauses while the tab is hidden, and
 disables its buttons whenever the overflow handler or the manual switch owns

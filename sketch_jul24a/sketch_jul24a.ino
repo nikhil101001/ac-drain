@@ -38,6 +38,7 @@
  *    POST /pump/on       manual run, capped at the normal cycle length
  *    POST /pump/off      stop immediately
  *    POST /api/config    set the run caps - ?run=<sec>&overflow=<sec>, ?reset=1
+ *    POST /api/update    firmware upload, multipart/form-data with one .bin
  *
  *  RUN CAPS
  *    Both are set from the dashboard and kept in NVS, so retiming the pump
@@ -49,9 +50,9 @@
  *
  *  OTA
  *    Password-protected over-the-air updates, so the controller can be
- *    reflashed without unplugging it - "./flash main --ota". See the OTA
- *    section below for why the pump is parked first and why an update is
- *    refused mid-overflow.
+ *    reflashed without unplugging it: "./flash main --ota" from a terminal, or
+ *    the dashboard's Firmware card from anything with a browser. Both park the
+ *    pump first and both are refused mid-overflow - see the OTA section below.
  *
  *  REMOTE ACCESS
  *    Telegram already works from anywhere. For the dashboard, put a VPN or a
@@ -74,6 +75,7 @@
 #include <UniversalTelegramBot.h>
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
+#include <Update.h>
 #include <Preferences.h>
 #include <time.h>
 
@@ -520,6 +522,36 @@ void startManualRun() {
   setPump(true, CAUSE_MANUAL);
 }
 
+/*
+ * Make the hardware safe before a firmware write, whichever way it arrives -
+ * the network OTA port or a browser upload. Both of them hold the loop for the
+ * length of the transfer, so this has to leave a state that is safe unattended.
+ *
+ * The relay is driven to its idle level directly as well as through setPump(),
+ * so the pump is off even if the incoming firmware never boots. Dropping any
+ * timed run matters for the failure case: if the write is abandoned and loop()
+ * resumes, ST_RUNNING with the pump off would sit out the rest of its cap doing
+ * nothing. From ST_IDLE a still-wet float just starts a fresh cycle, and an off
+ * switch re-asserts itself on the next pass.
+ */
+void parkForFirmwareWrite() {
+  setPump(false, CAUSE_OTA);
+  digitalWrite(PIN_PUMP, PUMP_IDLE_LEVEL);
+  writeIfChanged(PIN_LED_RED, ledRedOn, false);
+  writeIfChanged(PIN_BUZZER, buzzerOn, false);
+  if (state != ST_OVERFLOW) state = ST_IDLE;
+  logAdd(EV_OTA, CAUSE_OTA);
+}
+
+// Overflow outranks a firmware update. While the safety handler is actually
+// driving the pump it is the only thing between the tray and the floor, and a
+// transfer would hold the loop for a minute with nobody watching the float.
+// Once a blocked overflow has stopped the pump, updating is safe again - and is
+// usually the exact moment somebody wants to push a fix.
+static inline bool firmwareWriteAllowed() {
+  return !(state == ST_OVERFLOW && !overflowMaxRunHit);
+}
+
 // ---------------- TELEGRAM ----------------
 /*
  * Replies use HTML parse mode: a glyph + bold headline for the state, and a
@@ -730,16 +762,21 @@ void handleTelegramMessages(int numNewMessages) {
   #ifndef WEB_USER
     #define WEB_USER "admin"
   #endif
+// Answers "are these credentials good?" without sending anything. Split out
+// from needsAuth() because the firmware upload has to ask that question from
+// inside a request body, where sending a response is not an option yet.
+static inline bool webAuthOk() { return server.authenticate(WEB_USER, WEB_PASSWORD); }
+#else
+static inline bool webAuthOk() { return true; }
+#endif
+
 // Returns true when the request has already been answered with a 401, so every
 // handler can start with: if (needsAuth()) return;
 bool needsAuth() {
-  if (server.authenticate(WEB_USER, WEB_PASSWORD)) return false;
+  if (webAuthOk()) return false;
   server.requestAuthentication(DIGEST_AUTH, "AC Drain", "Authentication required");
   return true;
 }
-#else
-static inline bool needsAuth() { return false; }
-#endif
 
 void handleRoot() {
   if (needsAuth()) return;
@@ -869,6 +906,88 @@ void handlePumpOff() {
   setPump(false, CAUSE_MANUAL);
   state = ST_IDLE;
   server.send(200, "text/plain", "Pump stopped");
+}
+
+/*
+ * POST /api/update  -  firmware upload, multipart/form-data, one .bin
+ *
+ * The same job as the network OTA port, reached from a browser instead: pick
+ * the file, watch a bar, the controller restarts into it. Nothing but a phone
+ * required, which is the point - arduino-cli and a Python interpreter are a lot
+ * to ask of whoever happens to be standing next to the AC unit.
+ *
+ * Two things about this server shape the handler:
+ *
+ *  1. THE UPLOAD CALLBACK RUNS AS THE BODY ARRIVES, before the handler that
+ *     sends the response. So authentication is checked HERE, at the first
+ *     chunk, not in the handler that answers - by then the image would already
+ *     be in flash. WebServer has no way to refuse a body mid-flight, so a
+ *     rejected upload is received and discarded rather than written, and the
+ *     401 goes out at the end. Bandwidth is wasted; the partition is not.
+ *
+ *  2. THE RESTART CANNOT HAPPEN IN THE HANDLER. Calling ESP.restart() there
+ *     kills the connection before the response is flushed, and the browser
+ *     reports a network error on a flash that actually succeeded. So the reboot
+ *     is scheduled and loop() performs it once the answer is out of the door.
+ */
+const unsigned long REBOOT_DELAY_MS = 800;   // long enough to flush the response
+bool rebootPending         = false;
+unsigned long rebootReqMs  = 0;
+const char* updateError    = nullptr;        // first failure of the current upload
+
+void handleUpdateUpload() {
+  HTTPUpload& up = server.upload();
+
+  if (up.status == UPLOAD_FILE_START) {
+    updateError = nullptr;
+
+    if (!webAuthOk())            { updateError = "Authentication required.";   return; }
+    if (!firmwareWriteAllowed()) { updateError = "The 90% overflow float is wet - "
+                                                 "the pump has priority. Try again "
+                                                 "once it has cleared."; return; }
+
+    Serial.printf("[UPDATE] %s incoming from the dashboard\n", up.filename.c_str());
+    parkForFirmwareWrite();
+
+    // UPDATE_SIZE_UNKNOWN: a multipart body does not carry the image length, so
+    // the size is settled at end(). The Update library verifies the image magic
+    // byte on the first write, which is what catches "uploaded the wrong file".
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) updateError = Update.errorString();
+
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (updateError) return;                  // draining a rejected body
+    if (Update.write(up.buf, up.currentSize) != up.currentSize)
+      updateError = Update.errorString();
+
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (updateError) return;
+    if (!Update.end(true)) updateError = Update.errorString();
+
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    // Browser tab closed, WiFi dropped, cable pulled. The half-written image is
+    // in the *inactive* partition, so the running firmware is untouched and the
+    // board carries on watching the floats.
+    if (!updateError) updateError = "Upload aborted before it finished.";
+    Update.abort();
+  }
+}
+
+void handleUpdateDone() {
+  if (updateError) {
+    // 401 specifically, so a browser knows to prompt rather than just show text.
+    const bool authFail = !webAuthOk();
+    Serial.printf("[UPDATE] failed - %s\n", updateError);
+    if (authFail) { needsAuth(); return; }
+    server.send(500, "text/plain", updateError);
+    updateError = nullptr;
+    return;
+  }
+
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/plain", "Firmware written - restarting now.");
+  Serial.println("[UPDATE] written - restarting into the new firmware");
+  rebootReqMs = millis();
+  rebootPending = true;
 }
 
 /*
@@ -1161,21 +1280,7 @@ void beginOta() {
   ArduinoOTA.setPassword(OTA_PASSWORD);
 
   ArduinoOTA.onStart([]() {
-    // Hardware first, bookkeeping second. Everything below this point can be
-    // interrupted by a failed transfer; the relay must not be.
-    setPump(false, CAUSE_OTA);
-    digitalWrite(PIN_PUMP, PUMP_IDLE_LEVEL);
-    writeIfChanged(PIN_LED_RED, ledRedOn, false);
-    writeIfChanged(PIN_BUZZER, buzzerOn, false);
-
-    // Drop any timed run rather than leave a half-elapsed one behind: if the
-    // update fails and loop() resumes, ST_RUNNING with the pump off would sit
-    // out the rest of its cap doing nothing. From ST_IDLE a still-wet float
-    // just starts a fresh cycle, and an off switch re-asserts itself on the
-    // next pass.
-    if (state != ST_OVERFLOW) state = ST_IDLE;
-
-    logAdd(EV_OTA, CAUSE_OTA);
+    parkForFirmwareWrite();     // identical safety step to the browser upload
     Serial.println("\n[OTA] update starting - pump parked, holding the loop");
   });
 
@@ -1203,11 +1308,10 @@ void beginOta() {
   Serial.printf("[OTA] ready as %s.local - ./flash main --ota\n", OTA_HOSTNAME);
 }
 
-// Overflow outranks a firmware update, so the OTA port goes unserviced while
-// the safety handler is actually driving the pump. Once it has given up and
-// stopped (overflowMaxRunHit) the pump is idle and an update is safe again.
+// The network OTA port is serviced only when a firmware write would be safe.
+// The refusal is simply not answering: the sender times out and reports it.
 static inline bool otaAllowed() {
-  return otaReady && !(state == ST_OVERFLOW && !overflowMaxRunHit);
+  return otaReady && firmwareWriteAllowed();
 }
 
 // ---------------- SETUP ----------------
@@ -1295,6 +1399,10 @@ void setup() {
   server.on("/pump/on", HTTP_POST, handlePumpOn);
   server.on("/pump/off", HTTP_POST, handlePumpOff);
   server.on("/api/config", HTTP_POST, handleConfig);
+  // Two callbacks: the second streams the body as it arrives, the first answers
+  // once it is all in. Auth is enforced in the streaming one - see the comment
+  // on handleUpdateUpload.
+  server.on("/api/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.onNotFound([]() { server.send(404, "text/plain", "not found"); });
   server.begin();
 #ifdef WEB_PASSWORD
@@ -1344,6 +1452,15 @@ void loop() {
 
   serviceWifi(now);
   serviceTelegram();
+
+  // A browser upload schedules its restart rather than calling ESP.restart()
+  // from the handler, which would drop the connection before the response was
+  // flushed and report a network error on a flash that actually worked.
+  if (rebootPending && elapsedSince(now, rebootReqMs) >= REBOOT_DELAY_MS) {
+    Serial.println("[UPDATE] restarting");
+    Serial.flush();
+    ESP.restart();
+  }
 
   delay(1);   // yields to the WiFi/idle tasks instead of spinning a core flat out
 }
