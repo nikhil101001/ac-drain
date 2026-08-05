@@ -37,6 +37,12 @@
  *    GET  /api/log.csv   same log as a CSV download
  *    POST /pump/on       manual run, capped at the normal cycle length
  *    POST /pump/off      stop immediately
+ *    POST /api/config    set the run caps - ?run=<sec>&overflow=<sec>, ?reset=1
+ *
+ *  RUN CAPS
+ *    Both are set from the dashboard and kept in NVS, so retiming the pump
+ *    needs no reflash and survives a power cut. 4 min / 5 min are only the
+ *    defaults a fresh board starts from.
  *
  *  TELEGRAM   /status  /log  /pumpon  /pumpoff  /uptime  /help
  *             (a tap keyboard is attached, so nothing needs typing)
@@ -51,6 +57,7 @@
 #include <WebServer.h>
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
+#include <Preferences.h>
 #include <time.h>
 
 // Credentials live outside version control. Accepted either next to this
@@ -118,17 +125,43 @@ const unsigned long WIFI_RETRY_MS     = 20UL * 1000UL;         // reconnect atte
  * normal cap would declare a blockage that isn't one. Passing it is the signal
  * that the pump has had a fair go and still isn't draining.
  *
- * Both are per-run caps, not safety margins. Retime them if the bucket or the
- * pump changes; every message, reply and dashboard label reads these numbers
- * rather than a hardcoded string, so nothing is left claiming the old figure.
+ * Both are settable from the dashboard, because the right numbers are a
+ * property of the bucket and the pump - not of the firmware - and finding them
+ * takes a few tries with a stopwatch. The values below are only the defaults a
+ * freshly flashed board starts from.
  */
-const unsigned long runDurationMs = 4UL * 60UL * 1000UL;   // 4 min - normal cycle
-const unsigned long overflowRunMs = 5UL * 60UL * 1000UL;   // 5 min - overflow guard
+const unsigned long RUN_DEFAULT_MS      = 4UL * 60UL * 1000UL;   // 4 min - normal cycle
+const unsigned long OVERFLOW_DEFAULT_MS = 5UL * 60UL * 1000UL;   // 5 min - overflow guard
+
+// Bounds on what the dashboard is allowed to set. The ceiling is the one that
+// matters: the cap is the only thing that stops a pump running dry against a
+// tray that has already emptied, so "no limit" is not on the menu. The floor
+// just keeps a typo from turning the cycle into relay chatter.
+const unsigned long RUN_MIN_S = 10;
+const unsigned long RUN_MAX_S = 15UL * 60UL;
+
+// The live values. Loaded from NVS at boot, changed by POST /api/config.
+unsigned long runDurationMs = RUN_DEFAULT_MS;
+unsigned long overflowRunMs = OVERFLOW_DEFAULT_MS;
 
 // ---------------- GLOBALS ----------------
 WebServer server(80);
 WiFiClientSecure secured_client;
 UniversalTelegramBot bot(BOT_TOKEN, secured_client);
+
+/*
+ * NVS, for the two run caps and nothing else.
+ *
+ * This is the one thing on the board that earns a flash write, and it is worth
+ * being explicit about why - the event log a few sections down deliberately
+ * refuses to persist for the opposite reason. The log would write every few
+ * minutes, forever. These write only when a human moves a slider, which over
+ * the life of the controller is a handful of times. A setting that silently
+ * reverted to the compile-time default after a power cut would be far worse
+ * than the wear: the pump would quietly go back to the wrong timing and the
+ * dashboard would agree with it.
+ */
+Preferences prefs;
 
 struct DebouncedInput {
   uint8_t pin = 0;
@@ -209,7 +242,7 @@ char ipStr[16] = "0.0.0.0";       // cached: building it per request churned the
 // them, so new codes are appended - never inserted.
 enum EvCode : uint8_t {
   EV_BOOT = 0, EV_PUMP_ON, EV_PUMP_OFF, EV_OVERFLOW_ON, EV_OVERFLOW_OFF,
-  EV_BLOCKED, EV_WIFI_DOWN, EV_WIFI_UP, EV_SWITCH_OFF, EV_SWITCH_ON
+  EV_BLOCKED, EV_WIFI_DOWN, EV_WIFI_UP, EV_SWITCH_OFF, EV_SWITCH_ON, EV_CONFIG
 };
 enum EvCause : uint8_t {
   CAUSE_NONE = 0, CAUSE_AUTO, CAUSE_MANUAL, CAUSE_SWITCH, CAUSE_OVERFLOW
@@ -259,6 +292,7 @@ const char* evName(uint8_t code) {
     case EV_WIFI_UP:      return "wifi_up";
     case EV_SWITCH_OFF:   return "switch_off";
     case EV_SWITCH_ON:    return "switch_on";
+    case EV_CONFIG:       return "config";
   }
   return "?";
 }
@@ -298,6 +332,57 @@ static inline void writeIfChanged(uint8_t pin, bool& cache, bool on) {
   if (cache == on) return;
   cache = on;
   digitalWrite(pin, on ? HIGH : LOW);
+}
+
+// ---------------- RUN CAP STORAGE ----------------
+// Forward-declared: applyRunCaps() re-renders these, and they are defined with
+// the rest of the small helpers below.
+void fmtRunLen(char* out, size_t n, unsigned long secs);
+
+static inline bool runCapInRange(unsigned long secs) {
+  return secs >= RUN_MIN_S && secs <= RUN_MAX_S;
+}
+
+// Single place that moves the live caps, so the strings every message quotes
+// can never drift out of step with the numbers the pump actually uses.
+void applyRunCaps(unsigned long runS, unsigned long ovfS) {
+  runDurationMs = runS * 1000UL;
+  overflowRunMs = ovfS * 1000UL;
+  fmtRunLen(runDurStr, sizeof runDurStr, runS);
+  fmtRunLen(ovfDurStr, sizeof ovfDurStr, ovfS);
+}
+
+/*
+ * Load at boot, and be suspicious of what comes back.
+ *
+ * NVS is the one thing here that survives a reflash, so a stored value can
+ * outlive the firmware that wrote it - including a build whose bounds were
+ * different, or a half-finished write. Anything outside the current range is
+ * discarded in favour of the default rather than trusted, because the failure
+ * mode of an absurd cap is a pump running dry for as long as it says.
+ */
+void loadRunCaps() {
+  prefs.begin("acdrain", false);
+  unsigned long runS = prefs.getULong("run", RUN_DEFAULT_MS / 1000UL);
+  unsigned long ovfS = prefs.getULong("ovf", OVERFLOW_DEFAULT_MS / 1000UL);
+
+  if (!runCapInRange(runS)) {
+    Serial.printf("[CONFIG] stored run cap %lus out of range - using the default\n", runS);
+    runS = RUN_DEFAULT_MS / 1000UL;
+  }
+  if (!runCapInRange(ovfS)) {
+    Serial.printf("[CONFIG] stored overflow cap %lus out of range - using the default\n", ovfS);
+    ovfS = OVERFLOW_DEFAULT_MS / 1000UL;
+  }
+  applyRunCaps(runS, ovfS);
+}
+
+// Writes only when a value actually changed - Preferences::putULong is a flash
+// write, and the dashboard's Save button is perfectly capable of sending the
+// same numbers back at you all afternoon.
+void storeRunCaps(unsigned long runS, unsigned long ovfS) {
+  if (prefs.getULong("run", 0) != runS) prefs.putULong("run", runS);
+  if (prefs.getULong("ovf", 0) != ovfS) prefs.putULong("ovf", ovfS);
 }
 
 // "3h 12m" / "5m 20s" / "40s" - short enough for a tile or a Telegram column.
@@ -447,6 +532,10 @@ void evLabelShort(const LogEvent& e, char* out, size_t n) {
     case EV_WIFI_UP:      snprintf(out, n, "wifi back"); break;
     case EV_SWITCH_OFF:   snprintf(out, n, "switch off"); break;
     case EV_SWITCH_ON:    snprintf(out, n, "switch on"); break;
+    case EV_CONFIG:
+      fmtDur(d, sizeof d, e.detail);
+      snprintf(out, n, "run time set to %s", d);
+      break;
     default:              snprintf(out, n, "powered on"); break;
   }
 }
@@ -603,15 +692,15 @@ void handleStatus() {
   // SWITCH_CLOSED_IS_ENABLED never leaves the panel disagreeing with the pump.
   //
   // "duration" is the cap on the run in progress, which is what the progress
-  // bar is drawn against; "autoDur" and "ovfDur" are the two configured caps,
-  // so the page states no duration of its own and cannot fall out of step with
-  // the device.
+  // bar is drawn against; "autoDur" and "ovfDur" are the two configured caps
+  // and "minDur"/"maxDur" the range the config form may offer, so the page
+  // states no duration of its own and cannot fall out of step with the device.
   char buf[448];
   snprintf(buf, sizeof buf,
     "{\"state\":%u,\"pump\":%s,\"reed70\":%s,\"reed90\":%s,\"manual\":%s,"
     "\"enabled\":%s,"
     "\"elapsed\":%lu,\"remaining\":%ld,\"duration\":%lu,"
-    "\"autoDur\":%lu,\"ovfDur\":%lu,\"blocked\":%s,"
+    "\"autoDur\":%lu,\"ovfDur\":%lu,\"minDur\":%lu,\"maxDur\":%lu,\"blocked\":%s,"
     "\"starts\":%lu,\"overflows\":%lu,\"blocks\":%lu,"
     "\"pumpTotal\":%lu,\"uptime\":%lu,\"rssi\":%d,\"ip\":\"%s\","
     "\"seq\":%lu,\"boot\":%lu}",
@@ -620,7 +709,7 @@ void handleStatus() {
     pumpOn ? (now - pumpSinceMs) / 1000 : 0UL,
     remainingSecs(now),
     currentCapMs() / 1000UL,
-    runDurationMs / 1000UL, overflowRunMs / 1000UL,
+    runDurationMs / 1000UL, overflowRunMs / 1000UL, RUN_MIN_S, RUN_MAX_S,
     jbool(overflowMaxRunHit),
     pumpStarts, overflowCount, blockedCount,
     totalMs / 1000UL, now / 1000UL,
@@ -705,6 +794,57 @@ void handlePumpOff() {
   setPump(false, CAUSE_MANUAL);
   state = ST_IDLE;
   server.send(200, "text/plain", "Pump stopped");
+}
+
+/*
+ * POST /api/config?run=<sec>&overflow=<sec>   - either argument, or both
+ * POST /api/config?reset=1                    - back to the compile-time defaults
+ *
+ * Timing the pump is a stopwatch job that takes a few attempts, and doing it by
+ * editing a constant and reflashing is what made it tedious enough to leave at
+ * a guess. Anything omitted keeps its current value.
+ *
+ * Taking effect immediately includes a run already in progress: the state
+ * machine measures elapsed time against whatever the cap is on the pass it
+ * checks, so shortening it below what has already elapsed stops the pump on the
+ * next pass rather than at some point in the past. That is the behaviour you
+ * want while standing over the tray with a stopwatch, which is the only time
+ * anyone is on this endpoint.
+ */
+void handleConfig() {
+  unsigned long runS = runDurationMs / 1000UL;
+  unsigned long ovfS = overflowRunMs / 1000UL;
+  const bool reset = server.hasArg("reset");
+
+  if (reset) {
+    runS = RUN_DEFAULT_MS / 1000UL;
+    ovfS = OVERFLOW_DEFAULT_MS / 1000UL;
+  } else {
+    if (server.hasArg("run"))      runS = strtoul(server.arg("run").c_str(), nullptr, 10);
+    if (server.hasArg("overflow")) ovfS = strtoul(server.arg("overflow").c_str(), nullptr, 10);
+  }
+
+  char msg[160];
+  if (!runCapInRange(runS) || !runCapInRange(ovfS)) {
+    // Reject the whole request rather than applying the half of it that was
+    // valid - a partly-applied setting is the worst of both answers.
+    snprintf(msg, sizeof msg, "Run times must be between %lu and %lu seconds.",
+             RUN_MIN_S, RUN_MAX_S);
+    server.send(400, "text/plain", msg);
+    return;
+  }
+
+  const bool changed = (runS != runDurationMs / 1000UL) || (ovfS != overflowRunMs / 1000UL);
+  applyRunCaps(runS, ovfS);
+  if (changed) {
+    storeRunCaps(runS, ovfS);
+    logAdd(EV_CONFIG, CAUSE_MANUAL, (uint16_t)runS);
+    Serial.printf("[CONFIG] run caps set - %s cycle, %s overflow\n", runDurStr, ovfDurStr);
+  }
+
+  snprintf(msg, sizeof msg, "%s - %s cycle, %s overflow cap",
+           changed ? (reset ? "Reset" : "Saved") : "Unchanged", runDurStr, ovfDurStr);
+  server.send(200, "text/plain", msg);
 }
 
 // ---------------- CONTROL LOGIC ----------------
@@ -918,10 +1058,10 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
-  // Render the run caps once, here, so every later message can quote them by
-  // pointer rather than by literal.
-  fmtRunLen(runDurStr, sizeof runDurStr, runDurationMs / 1000UL);
-  fmtRunLen(ovfDurStr, sizeof ovfDurStr, overflowRunMs / 1000UL);
+  // Restores whatever was set from the dashboard, and renders the strings every
+  // later message quotes - so the caps and the words describing them come from
+  // the same place, once, before anything can print either.
+  loadRunCaps();
 
   Serial.printf("\n[BOOT] AC drain controller - %s cycle, %s overflow cap\n",
                 runDurStr, ovfDurStr);
@@ -989,6 +1129,7 @@ void setup() {
   server.on("/api/log.csv", HTTP_GET, handleLogCsv);
   server.on("/pump/on", HTTP_POST, handlePumpOn);
   server.on("/pump/off", HTTP_POST, handlePumpOff);
+  server.on("/api/config", HTTP_POST, handleConfig);
   server.onNotFound([]() { server.send(404, "text/plain", "not found"); });
   server.begin();
   Serial.println("[HTTP] dashboard up on port 80");

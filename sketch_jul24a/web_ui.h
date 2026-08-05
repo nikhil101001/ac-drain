@@ -101,6 +101,25 @@ button:active:not(:disabled){transform:scale(.985)}
 button:disabled{opacity:.38;cursor:not-allowed}
 .hint{margin-top:9px;font-size:12px;color:var(--dim);text-align:center;min-height:17px}
 
+.cfg{margin-top:8px;padding:6px 14px 14px}
+.fr{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--line)}
+.fr div{flex:1;min-width:0}
+.fr label{display:block;font-size:13px}
+.fr i{display:block;font-style:normal;font-size:11px;line-height:1.5;color:var(--dim)}
+.fr input{width:76px;padding:9px 10px;text-align:right;
+font:inherit;font-size:14px;color:var(--tx);background:var(--sunk);
+border:1px solid var(--line);border-radius:10px;appearance:textfield;-moz-appearance:textfield}
+.fr input:focus{outline:none;border-color:var(--info)}
+.fr input:invalid{border-color:var(--bad)}
+.fr .u{font-size:12px;color:var(--dim);margin-left:6px}
+/* Input, unit and the live minutes/seconds reading stack right-aligned, so the
+   number you typed and what it actually means sit on top of each other. */
+.fr .in{flex:0 0 auto;text-align:right}
+.fr .eq{display:block;margin-top:5px;font-style:normal;font-size:11px;line-height:1.4;
+color:var(--dim);white-space:nowrap}
+.fr .eq.bad{color:var(--bad)}
+.cfg button{width:100%;margin-top:12px}
+
 .sec{margin-top:20px;display:flex;align-items:baseline;justify-content:space-between;gap:10px}
 .sec h2{margin:0;font-weight:600;font-size:11px;line-height:1.4;letter-spacing:1px;text-transform:uppercase;color:var(--dim)}
 .sec a{font-size:11px;color:var(--info);text-decoration:none;font-weight:600}
@@ -173,6 +192,35 @@ transform:translate(-50%,160%);transition:transform .3s cubic-bezier(.2,.9,.3,1)
     <button id="boff" disabled>Stop pump</button>
   </section>
   <div class="hint" id="hint"></div>
+
+  <div class="sec">
+    <h2>Run times</h2>
+    <a href="#" id="crst">Reset to defaults</a>
+  </div>
+  <section class="card cfg">
+    <div class="fr">
+      <div>
+        <label for="cr">Auto cycle</label>
+        <i>Each run at 70%, repeated while the float stays wet</i>
+      </div>
+      <div class="in">
+        <span><input id="cr" type="number" inputmode="numeric"><span class="u">s</span></span>
+        <i class="eq" id="creq">&nbsp;</i>
+      </div>
+    </div>
+    <div class="fr">
+      <div>
+        <label for="co">Overflow cap</label>
+        <i>One run at 90%; past this it is called a blockage</i>
+      </div>
+      <div class="in">
+        <span><input id="co" type="number" inputmode="numeric"><span class="u">s</span></span>
+        <i class="eq" id="coeq">&nbsp;</i>
+      </div>
+    </div>
+    <button id="csave">Save run times</button>
+  </section>
+  <div class="note" id="cn"></div>
 
   <div class="sec">
     <h2>Activity log</h2>
@@ -272,6 +320,78 @@ function render(d) {
   $('bon').disabled = busy || locked || d.pump;
   $('boff').disabled = busy || locked || !d.pump;
   $('hint').textContent = LOCK[s] || '';
+  seedCfg(d);
+}
+
+/*
+ * Run times.
+ *
+ * The form is seeded from the device and NOT re-seeded once it has been
+ * touched: this page polls every 2 seconds, and overwriting a half-typed number
+ * four times a minute would make the field unusable. cfgTouched stays set until
+ * a save succeeds or the reset link replaces the values outright, at which
+ * point the device's answer is the truth again.
+ */
+let cfgTouched = false, cfgMin = 10, cfgMax = 900;
+
+function seedCfg(d) {
+  cfgMin = d.minDur; cfgMax = d.maxDur;
+  for (const id of ['cr', 'co']) {
+    $(id).min = cfgMin;
+    $(id).max = cfgMax;
+  }
+  if (cfgTouched) return;
+  $('cr').value = d.autoDur;
+  $('co').value = d.ovfDur;
+  cfgNote();
+}
+
+/*
+ * Echo each field back in minutes and seconds, right under the box, live as it
+ * is typed.
+ *
+ * Seconds is the only unit that can express a 4m 30s cycle without a second
+ * input box, but nobody reads 270 as four and a half minutes - so the page does
+ * that arithmetic rather than leaving it to whoever is holding the stopwatch.
+ * Out of range says so in the same place, next to the number that caused it,
+ * instead of only in a summary line below the card.
+ */
+function cfgNote() {
+  const bad = v => !(v >= cfgMin && v <= cfgMax);
+  let anyBad = false;
+
+  for (const [box, out] of [['cr', 'creq'], ['co', 'coeq']]) {
+    const v = +$(box).value;
+    const off = bad(v);
+    anyBad = anyBad || off;
+    $(out).textContent = off ? 'out of range' : '= ' + runlen(v);
+    $(out).className = 'eq' + (off ? ' bad' : '');
+  }
+
+  $('cn').textContent = anyBad
+    ? 'Both must be between ' + cfgMin + ' and ' + cfgMax + ' seconds (' +
+      runlen(cfgMin) + ' to ' + runlen(cfgMax) + ').'
+    : 'Saved on the controller and kept over a power cut. A change applies to a '
+      + 'run already under way.';
+}
+
+async function saveCfg(qs) {
+  if (busy) return;
+  busy = true;
+  $('csave').disabled = true;
+  try {
+    const r = await fetch('/api/config?' + qs, { method: 'POST' });
+    const t = await r.text();
+    toast(t || (r.ok ? 'Saved' : 'Failed'));
+    // Only on success: a rejected value has to stay in the box to be corrected,
+    // and the next poll would otherwise quietly replace it with the old one.
+    if (r.ok) cfgTouched = false;
+  } catch (e) {
+    toast('Save failed — no connection to the controller');
+  }
+  busy = false;
+  $('csave').disabled = false;
+  poll();
 }
 
 /*
@@ -294,7 +414,8 @@ const EV = [
   ['WiFi restored',          ''    ],   // 7
   ['Manual switch OFF',      'warn'],   // 8
   ['Manual switch ON',       ''    ],   // 9
-  ['Firmware update',        'warn']    // 10
+  ['Firmware update',        'warn'],   // 10
+  ['Run times changed',      'warn']    // 11
 ];
 const CAUSE = ['', 'auto cycle', 'manual', 'manual switch', 'overflow', 'firmware update'];
 
@@ -312,6 +433,7 @@ function evDetail(e) {
   if (code === 1 && cause) return CAUSE[cause];
   if (code === 2 && detail) return 'ran ' + dur(detail);
   if (code === 4 && detail) return 'lasted ' + dur(detail);
+  if (code === 11 && detail) return 'auto cycle now ' + dur(detail);
   return '';
 }
 
@@ -408,6 +530,13 @@ async function cmd(path) {
 
 $('bon').onclick = () => cmd('/pump/on');
 $('boff').onclick = () => cmd('/pump/off');
+
+for (const id of ['cr', 'co']) {
+  $(id).oninput = () => { cfgTouched = true; cfgNote(); };
+}
+$('csave').onclick = () =>
+  saveCfg('run=' + (+$('cr').value) + '&overflow=' + (+$('co').value));
+$('crst').onclick = e => { e.preventDefault(); saveCfg('reset=1'); };
 
 document.addEventListener('visibilitychange', poll);
 poll();

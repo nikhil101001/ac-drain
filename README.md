@@ -15,6 +15,10 @@ uninterrupted run rather than a repeating cycle, there is more water to shift at
 90%, and cutting it off at the normal 4 min would report a blockage that is
 really just a bigger job.
 
+Both times are **set from the dashboard**, not the source. They are stored on the
+controller and survive a power cut; 4 min and 5 min are only what a freshly
+flashed board starts with. See [Run times](#run-times).
+
 The **manual switch is an enable switch, not a run switch.** In its OFF position
 the pump stops immediately and automatic operation is suspended. The run timer is
 *frozen, not reset* — turn the switch back on with a float still wet and the pump
@@ -104,6 +108,41 @@ than failing silently.
 | `WIFI_SSID`, `WIFI_PASSWORD` | Required |
 | `BOT_TOKEN`, `CHAT_ID` | Required — from @BotFather and @userinfobot |
 
+## Run times
+
+Both run caps are set from the **Run times** card on the dashboard, in seconds,
+and stored in NVS on the controller — so retiming the pump needs no reflash and
+survives a power cut.
+
+This is the one thing on the board that is deliberately written to flash. The
+event log refuses to persist for the opposite reason: it would write every few
+minutes forever, whereas these are written only when someone moves the number.
+
+- **Auto cycle** — every ordinary timed run: the 70% cycle and any manual run
+  from the dashboard or Telegram.
+- **Overflow cap** — the deadline on the single run at 90%. Past it, the pump is
+  stopped and the level is reported as a blockage.
+
+Anything from **10 s to 15 min** is accepted. The ceiling is not arbitrary: the
+cap is the only thing that stops the pump running dry once the tray has emptied,
+so there is no "no limit" option. Values outside the range are rejected whole
+rather than half-applied, and a stored value that falls outside the range of the
+firmware reading it — after a downgrade, say — is discarded for the default
+rather than trusted.
+
+A change takes effect immediately, including on a run already in progress:
+shorten the cap below what has already elapsed and the pump stops on the next
+pass. That is the behaviour you want while standing over the tray with a
+stopwatch, which is the only reason to be on this card.
+
+Changes are recorded in the activity log, so a pump that starts behaving
+differently can be traced to the moment someone retimed it.
+
+```
+POST /api/config?run=240&overflow=300   # either argument, or both
+POST /api/config?reset=1                # back to the firmware defaults
+```
+
 ## Flashing
 
 `./flash` wraps compile, upload and monitor. It finds `arduino-cli` inside the
@@ -133,12 +172,13 @@ can leave the board silent and looking bricked until a clean upload clears it.
 
 | Route | |
 | --- | --- |
-| `GET /` | Dashboard: tank level, live state, run countdown, activity log, controls |
+| `GET /` | Dashboard: tank level, live state, run countdown, run times, activity log, controls |
 | `GET /api/status` | JSON status |
 | `GET /api/log` | Event log; `?since=<seq>` for an incremental fetch |
 | `GET /api/log.csv` | The same log as a CSV download |
 | `POST /pump/on` | Manual run, capped at the auto-cycle length |
 | `POST /pump/off` | Stop immediately |
+| `POST /api/config` | Set the run caps — `?run=<sec>&overflow=<sec>`, or `?reset=1` |
 
 The dashboard polls `/api/status` every 2s, pauses while the tab is hidden, and
 disables its buttons whenever the overflow handler or the manual switch owns
@@ -152,8 +192,8 @@ cannot leave the UI confidently quoting the old number.
 The controller records the events that matter and nothing else: boot, pump start
 (with what triggered it — auto cycle, manual, the manual switch, or overflow),
 pump stop with run duration, overflow began and cleared, blockage detected,
-manual switch turned off/on, and WiFi lost/restored. No per-poll or per-debounce
-noise.
+manual switch turned off/on, WiFi lost/restored, firmware updated, and run times
+changed. No per-poll or per-debounce noise.
 
 It lives in a **fixed 256-entry ring buffer in RAM** — 2 KB, statically
 allocated, oldest entry overwritten. Nothing is written to flash: this device
