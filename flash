@@ -273,14 +273,27 @@ do_ota() {
 
   bin=$(build_image)
 
-  say "uploading to $OTA_HOST over the air"
-  python3 "$espota" -i "$OTA_HOST" -p 3232 --auth="$pw" -f "$bin" -r || die "OTA upload failed.
+  # One automatic retry. A transfer this size over WiFi drops often enough to be
+  # annoying - a stalled TCP window shows up as "Broken pipe" partway through -
+  # and retrying is safe: a half-sent image only ever lands in the partition the
+  # board is NOT running from, so the failed attempt leaves nothing to undo.
+  local try
+  for try in 1 2; do
+    if [ "$try" = 1 ]; then say "uploading to $OTA_HOST over the air"
+    else                    say "uploading to $OTA_HOST over the air (retry)"; fi
+    if python3 "$espota" -i "$OTA_HOST" -p 3232 --auth="$pw" -f "$bin" -r; then
+      printf '%s ok %s %s is running on %s\n' "$G" "$Z" "$SKETCH" "$OTA_HOST"
+      return 0
+    fi
+    [ "$try" = 1 ] && { warn "transfer did not complete - the board still has its old firmware, retrying"; sleep 3; }
+  done
+
+  die "OTA upload failed twice.
     - board offline, or $OTA_HOST not resolving? Retry with --host <ip>
     - refused mid-overflow? The pump has priority; try once it has cleared
     - authentication failed? OTA_PASSWORD here differs from the one flashed
-    A USB upload always works as a fallback: ./flash $SKETCH"
-
-  printf '%s ok %s %s is running on %s\n' "$G" "$Z" "$SKETCH" "$OTA_HOST"
+    - weak signal? Check the RSSI on the dashboard
+    Nothing was changed on the board. A USB upload always works: ./flash $SKETCH"
 }
 
 do_monitor() {
