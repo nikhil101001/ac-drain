@@ -1419,10 +1419,15 @@ void setup() {
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     Serial.printf("[WIFI] connected - http://%s\n", ipStr);
     beginOta();
-    char msg[220];
+    // The run times are quoted because they live in NVS, not in the firmware:
+    // after an OTA update this is the one place they can be checked without
+    // opening the dashboard.
+    char msg[256];
     snprintf(msg, sizeof msg,
              "\xE2\x9A\xAA <b>Controller online</b>\n"
-             "Dashboard: http://%s\nor http://%s.local", ipStr, OTA_HOSTNAME);
+             "Dashboard: http://%s\nor http://%s.local\n"
+             "Pump runs %s at 70%%, %s at 90%%", ipStr, OTA_HOSTNAME,
+             runDurStr, ovfDurStr);
     telegramReplyWithMenu(CHAT_ID, msg);   // also installs the tap keyboard
   } else {
     Serial.println("[WIFI] failed - continuing offline, reed/pump logic still works");
