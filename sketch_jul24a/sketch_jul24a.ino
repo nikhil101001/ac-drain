@@ -1118,11 +1118,19 @@ void handleOverflow(unsigned long now) {
   // First alert fires immediately; the cooldown only throttles the repeats.
   // (The old `millis() - lastAlertMs > COOLDOWN` test silently swallowed any
   // alert during the first 5 minutes of uptime, when lastAlertMs was still 0.)
-  if (wet && (!overflowAlerted || now - lastAlertMs >= ALERT_COOLDOWN_MS)) {
+  // Only while the pump is actually running: once a run has been called a
+  // blockage, "pump is running" would be false, and with a 5 min cap and a 5 min
+  // cooldown it used to arrive in the same pass as the "Not draining" alert.
+  if (wet && !overflowMaxRunHit &&
+      (!overflowAlerted || now - lastAlertMs >= ALERT_COOLDOWN_MS)) {
     overflowAlerted = true;
     lastAlertMs = now;
-    telegramSend("\xF0\x9F\x94\xB4 <b>Overflow - 90%</b>\n"
-                 "Pump is running to clear it. Check the drain line if this doesn't resolve.");
+    char msg[200];
+    snprintf(msg, sizeof msg,
+             "\xF0\x9F\x94\xB4 <b>Overflow - 90%%</b>\n"
+             "Pump is running for %s to clear it. "
+             "Check the drain line if this doesn't resolve.", ovfDurStr);
+    telegramSend(msg);
   }
 }
 
