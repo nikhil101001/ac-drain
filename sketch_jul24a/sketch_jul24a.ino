@@ -1207,6 +1207,12 @@ void syncClock() {
   Serial.printf("[TIME] clock synced, boot epoch %lu\n", (unsigned long)bootEpoch);
 }
 
+// Forward-declared: defined with the rest of the OTA code below. Declaring it
+// here rather than leaning on the IDE's generated prototypes keeps the sketch
+// buildable when ctags can't run (it is x86-only on macOS, so no Rosetta, no
+// prototypes).
+void beginOta();
+
 void serviceWifi(unsigned long now) {
   const bool up = (WiFi.status() == WL_CONNECTED);
   if (up != wifiUp) {
