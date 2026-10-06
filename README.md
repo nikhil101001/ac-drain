@@ -5,10 +5,18 @@ with a web dashboard, Telegram control and over-the-air updates.
 
 Two reed float switches watch the tray. At **70%** the pump runs a **4 min**
 cycle and repeats while the float stays wet. At **90%** the overflow handler
-takes over: pump forced on, red LED, beeping buzzer, Telegram alert — and if a
-full **5 min** run does not drop the level, the pump is stopped and flagged as
-blocked, because at that point it clearly isn't draining and the pump is the
-thing worth protecting.
+takes over: pump forced on for a full **5 min**, red LED, beeping buzzer,
+Telegram alert. If the water is still at 90% when that run ends, the pump is
+stopped and flagged as blocked, because at that point it clearly isn't draining
+and the pump is the thing worth protecting.
+
+The 5 min overflow run is **latched**. The 90% float dropping partway through
+does not end it, so the 90% float on its own is enough to drain the tray. Until
+this was fixed, the overflow run stopped as soon as the water fell just below
+the float, a few seconds in. That only worked when a healthy 70% float took over
+afterwards with its normal cycle. With a dead 70% float, nothing took over and
+the tray was left at 89%. The red LED and buzzer still follow the float itself,
+so they go quiet once the water is below 90% even though the pump keeps running.
 
 The overflow run gets the longer cap on purpose. It is a deadline on one
 uninterrupted run rather than a repeating cycle, there is more water to shift at
@@ -37,7 +45,7 @@ Priority is strict: **overflow > manual switch OFF > web/Telegram manual > auto 
 | Pump relay IN | 23 | **Active-high on this build** — see `RELAY_ACTIVE_LOW`. **Also needs a 10k pull-down to GND.** |
 | Green LED | 19 | Lit while the relay is energised |
 | Red LED | 18 | Lit while the 90% float is wet |
-| Buzzer (BC337 base via 1k) | 22 | Sounds during overflow, plus one short self-test beep at boot |
+| Buzzer (BC337 base via 1k) | 22 | Sounds while the 90% float is wet, plus one short self-test beep at boot |
 | White LED | — | Wired straight to 3V3 through a resistor |
 
 **LED polarity:** anode (+) to the GPIO through the resistor, cathode (−) to GND.
@@ -123,8 +131,10 @@ minutes forever, whereas these are written only when someone moves the number.
 
 - **Auto cycle** — every ordinary timed run: the 70% cycle and any manual run
   from the dashboard or Telegram.
-- **Overflow cap** — the deadline on the single run at 90%. Past it, the pump is
-  stopped and the level is reported as a blockage.
+- **Overflow cap** — the length of the single run the 90% float starts. The run
+  always goes the full length, even once the water drops below 90%. If it is
+  still at 90% at the end, the pump is stopped and the level is reported as a
+  blockage.
 
 Anything from **10 s to 15 min** is accepted. The ceiling is not arbitrary: the
 cap is the only thing that stops the pump running dry once the tray has emptied,

@@ -219,7 +219,7 @@ transform:translate(-50%,160%);transition:transform .3s cubic-bezier(.2,.9,.3,1)
     <div class="fr">
       <div>
         <label for="co">Overflow cap</label>
-        <i>One run at 90%; past this it is called a blockage</i>
+        <i>Full run when 90% trips; still at 90% after it is a blockage</i>
       </div>
       <div class="in">
         <span><input id="co" type="number" inputmode="numeric"><span class="u">s</span></span>
@@ -304,7 +304,9 @@ function render(d) {
   $('st').textContent = NAME[s] || '?';
   // A manual run is the one state whose cap is worth spelling out — it is the
   // only one somebody started by hand and might expect to keep going.
-  $('sub').textContent = (SUB[s] || '') +
+  // The overflow run is latched, so it goes on after the 90% float drops -
+  // and the panel should not keep claiming the water is at 90% once it has dropped.
+  $('sub').textContent = (s === 4 && !d.reed90 ? 'Below 90% — finishing the overflow run' : SUB[s] || '') +
     (s === 2 && d.duration ? ', ' + runlen(d.duration) + ' cap' : '');
 
   // Reeds are the only level information we have, so show what they prove:
@@ -342,7 +344,7 @@ function render(d) {
   $('ip').textContent = d.ip + (d.ota ? ' · ' + d.host + '.local · OTA ready' : '');
   $('fd').textContent =
     'Auto cycle: ' + runlen(d.autoDur) + ' per run, repeats while the 70% float is wet. ' +
-    'Overflow runs up to ' + runlen(d.ovfDur) + ' before it is called a blockage.';
+    'Overflow: one full ' + runlen(d.ovfDur) + ' run when the 90% float trips, called a blockage if still at 90% after it.';
 
   $('bon').disabled = busy || locked || d.pump;
   $('boff').disabled = busy || locked || !d.pump;

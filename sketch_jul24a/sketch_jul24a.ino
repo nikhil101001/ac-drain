@@ -11,10 +11,11 @@
  *    Reed OVERFLOW closes (water at 90%)
  *        -> pump forced ON to clear it, red LED + buzzer, Telegram alert. The
  *           overflow run gets a LONGER cap than the normal cycle - 5 min - on
- *           the grounds that there is more water to shift. If that full run
- *           does not drop the level, the pump is stopped (it plainly isn't
- *           draining) and a "check for a blockage" alert goes out. Better a wet
- *           tray than a burnt-out pump.
+ *           the grounds that there is more water to shift, and it always runs
+ *           the full 5 min: the float dropping partway does not end it. If the
+ *           water is still at 90% when it finishes, the pump is stopped (it
+ *           plainly isn't draining) and a "check for a blockage" alert goes
+ *           out. Better a wet tray than a burnt-out pump.
  *    Manual switch  -  an ENABLE switch, not a run switch
  *        -> OFF stops the pump at once and suspends automatic operation. The
  *           run timer is FROZEN, not reset: switch back on with a float still
@@ -149,10 +150,12 @@ const unsigned long WIFI_RETRY_MS     = 20UL * 1000UL;         // reconnect atte
  * next one, so a tray that needs longer gets more cycles rather than one long
  * run; the cap is what stops the pump running dry against an empty tray.
  *
- * The OVERFLOW cap is longer only because it is the deadline on a single
+ * The OVERFLOW cap is longer only because it is the length of a single
  * uninterrupted run: at 90% there is more water to shift, and stopping at the
- * normal cap would declare a blockage that isn't one. Passing it is the signal
- * that the pump has had a fair go and still isn't draining.
+ * normal cap would declare a blockage that isn't one. The run always goes the
+ * full length - the 90% float dropping partway does not end it - and reaching
+ * the end still at 90% is the signal that the pump has had a fair go and still
+ * isn't draining.
  *
  * Both are settable from the dashboard, because the right numbers are a
  * property of the bucket and the pump - not of the firmware - and finding them
@@ -1043,42 +1046,55 @@ void handleConfig() {
 }
 
 // ---------------- CONTROL LOGIC ----------------
+// Leaving overflow MUST stop the pump. Resetting the state to idle with the
+// relay still closed leaves nothing to switch it off if the 70% float is dry
+// too, and the pump runs indefinitely.
+void endOverflow(unsigned long now) {
+  setPump(false, CAUSE_OVERFLOW);
+  state = ST_IDLE;
+  overflowAlerted = false;
+  const unsigned long heldS = (now - overflowStartMs) / 1000;
+  logAdd(EV_OVERFLOW_OFF, CAUSE_NONE, heldS > 65535 ? 65535 : (uint16_t)heldS);
+  Serial.println("[OVERFLOW] cleared - resuming normal operation");
+}
+
+/*
+ * The 90% float starts ONE run of the full overflow cap, and that run is
+ * latched: it does not end when the float drops.
+ *
+ * It used to. The run stopped the moment the 90% float went dry, on the
+ * assumption that the 70% float would carry on from there with a normal cycle.
+ * With the 70% float broken nothing did, so every overflow pumped for the few
+ * seconds it took to get the water just under the float and then stopped,
+ * leaving the tray at 89%. Running the whole cap regardless means the 90% float
+ * alone is enough to drain the tray, and with a working 70% float a tray that
+ * is still wet afterwards simply goes on to its normal cycles.
+ *
+ * The red LED and the buzzer follow the float, not the run: they mean "the
+ * water is at 90%", and there is no point beeping for minutes after it isn't.
+ */
 void handleOverflow(unsigned long now) {
-  if (!reedOverflow.state) {
-    if (state == ST_OVERFLOW) {
-      // Leaving overflow MUST stop the pump. Previously the state was reset to
-      // idle with the relay still closed, so if the 70% float was dry too the
-      // pump had nothing left to switch it off and ran indefinitely.
-      setPump(false, CAUSE_OVERFLOW);
-      state = ST_IDLE;
-      overflowAlerted = false;
-      const unsigned long heldS = (now - overflowStartMs) / 1000;
-      logAdd(EV_OVERFLOW_OFF, CAUSE_NONE, heldS > 65535 ? 65535 : (uint16_t)heldS);
-      Serial.println("[OVERFLOW] cleared - resuming normal operation");
-    }
-    writeIfChanged(PIN_LED_RED, ledRedOn, false);
-    writeIfChanged(PIN_BUZZER, buzzerOn, false);
-    return;
-  }
+  const bool wet = reedOverflow.state;
+  writeIfChanged(PIN_LED_RED, ledRedOn, wet);
+  writeIfChanged(PIN_BUZZER, buzzerOn, wet);
 
   if (state != ST_OVERFLOW) {
+    if (!wet) return;
     state = ST_OVERFLOW;
     overflowStartMs = now;
     overflowMaxRunHit = false;
     overflowCount++;
     logAdd(EV_OVERFLOW_ON);
-    Serial.println("[OVERFLOW] 90% reached - forcing pump ON");
+    Serial.printf("[OVERFLOW] 90%% reached - pump ON for %s\n", ovfDurStr);
   }
-
-  writeIfChanged(PIN_LED_RED, ledRedOn, true);
-  writeIfChanged(PIN_BUZZER, buzzerOn, true);
 
   // The overflow run gets its own, longer cap: there is more water to shift at
   // 90% than the normal cycle is timed for, and cutting it off at 4 min would
   // report a blockage that is really just a bigger job.
   if (!overflowMaxRunHit) {
-    setPump(true, CAUSE_OVERFLOW);
-    if (elapsedSince(now, overflowStartMs) >= overflowRunMs) {
+    if (elapsedSince(now, overflowStartMs) < overflowRunMs) {
+      setPump(true, CAUSE_OVERFLOW);
+    } else if (wet) {
       overflowMaxRunHit = true;
       setPump(false, CAUSE_OVERFLOW);
       blockedCount++;
@@ -1090,13 +1106,19 @@ void handleOverflow(unsigned long now) {
                "The pump ran a full %s and the water is still at 90%%. "
                "Stopped to protect it - check for a blockage now.", ovfDurStr);
       telegramSend(msg);
+    } else {
+      endOverflow(now);                // full run done and the level came down
+      return;
     }
+  } else if (!wet) {
+    endOverflow(now);                  // blocked, and the water has since gone down
+    return;
   }
 
   // First alert fires immediately; the cooldown only throttles the repeats.
   // (The old `millis() - lastAlertMs > COOLDOWN` test silently swallowed any
   // alert during the first 5 minutes of uptime, when lastAlertMs was still 0.)
-  if (!overflowAlerted || now - lastAlertMs >= ALERT_COOLDOWN_MS) {
+  if (wet && (!overflowAlerted || now - lastAlertMs >= ALERT_COOLDOWN_MS)) {
     overflowAlerted = true;
     lastAlertMs = now;
     telegramSend("\xF0\x9F\x94\xB4 <b>Overflow - 90%</b>\n"
