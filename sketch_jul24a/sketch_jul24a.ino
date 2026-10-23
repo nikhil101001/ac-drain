@@ -6,20 +6,20 @@
  *
  *  BEHAVIOUR
  *    Reed HIGH closes (water at 70%)
- *        -> pump runs for 4 min, then stops. If the float is still wet, a fresh
- *           4 min cycle starts after a short gap (repeats).
+ *        -> pump runs for 1 min 30 s, then stops. If the float is still wet, a
+ *           fresh 1 min 30 s cycle starts after a short gap (repeats).
  *    Reed OVERFLOW closes (water at 90%)
  *        -> pump forced ON to clear it, red LED + buzzer, Telegram alert. The
- *           overflow run gets a LONGER cap than the normal cycle - 5 min - on
+ *           overflow run gets a LONGER cap than the normal cycle - 2 min - on
  *           the grounds that there is more water to shift, and it always runs
- *           the full 5 min: the float dropping partway does not end it. If the
+ *           the full 2 min: the float dropping partway does not end it. If the
  *           water is still at 90% when it finishes, the pump is stopped (it
  *           plainly isn't draining) and a "check for a blockage" alert goes
  *           out. Better a wet tray than a burnt-out pump.
  *    Manual switch  -  an ENABLE switch, not a run switch
  *        -> OFF stops the pump at once and suspends automatic operation. The
  *           run timer is FROZEN, not reset: switch back on with a float still
- *           wet and the pump finishes the remainder of the 4 min rather than
+ *           wet and the pump finishes the remainder of the cycle rather than
  *           starting the cycle over. A 90% overflow ignores the switch
  *           entirely - water damage outranks it.
  *
@@ -43,7 +43,7 @@
  *
  *  RUN CAPS
  *    Both are set from the dashboard and kept in NVS, so retiming the pump
- *    needs no reflash and survives a power cut. 4 min / 5 min are only the
+ *    needs no reflash and survives a power cut. 1 min 30 s / 2 min are only the
  *    defaults a fresh board starts from.
  *
  *  TELEGRAM   /status  /log  /pumpon  /pumpoff  /uptime  /help
@@ -162,8 +162,8 @@ const unsigned long WIFI_RETRY_MS     = 20UL * 1000UL;         // reconnect atte
  * takes a few tries with a stopwatch. The values below are only the defaults a
  * freshly flashed board starts from.
  */
-const unsigned long RUN_DEFAULT_MS      = 4UL * 60UL * 1000UL;   // 4 min - normal cycle
-const unsigned long OVERFLOW_DEFAULT_MS = 5UL * 60UL * 1000UL;   // 5 min - overflow guard
+const unsigned long RUN_DEFAULT_MS      = 90UL * 1000UL;         // 1 min 30 s - normal cycle
+const unsigned long OVERFLOW_DEFAULT_MS = 2UL * 60UL * 1000UL;   // 2 min - overflow guard
 
 // Bounds on what the dashboard is allowed to set. The ceiling is the one that
 // matters: the cap is the only thing that stops a pump running dry against a
@@ -229,7 +229,7 @@ bool otaReady = false;            // OTA port is listening
 bool overflowMaxRunHit = false;   // a full run didn't clear 90%
 bool overflowAlerted   = false;   // first alert of this overflow already sent
 
-// The two run caps rendered once at boot ("4m", "5m"). Every message, reply and
+// The two run caps rendered once at boot ("1m 30s", "2m"). Every message, reply and
 // dashboard label quotes these instead of a literal, so retiming a run cannot
 // leave the UI confidently stating a number the pump no longer uses.
 char runDurStr[12] = "";
@@ -1089,8 +1089,8 @@ void handleOverflow(unsigned long now) {
   }
 
   // The overflow run gets its own, longer cap: there is more water to shift at
-  // 90% than the normal cycle is timed for, and cutting it off at 4 min would
-  // report a blockage that is really just a bigger job.
+  // 90% than the normal cycle is timed for, and cutting it off at that length
+  // would report a blockage that is really just a bigger job.
   if (!overflowMaxRunHit) {
     if (elapsedSince(now, overflowStartMs) < overflowRunMs) {
       setPump(true, CAUSE_OVERFLOW);

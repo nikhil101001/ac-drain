@@ -3,14 +3,14 @@
 ESP32 controller that empties an air-conditioner condensate tray on its own,
 with a web dashboard, Telegram control and over-the-air updates.
 
-Two reed float switches watch the tray. At **70%** the pump runs a **4 min**
+Two reed float switches watch the tray. At **70%** the pump runs a **1 min 30 s**
 cycle and repeats while the float stays wet. At **90%** the overflow handler
-takes over: pump forced on for a full **5 min**, red LED, beeping buzzer,
+takes over: pump forced on for a full **2 min**, red LED, beeping buzzer,
 Telegram alert. If the water is still at 90% when that run ends, the pump is
 stopped and flagged as blocked, because at that point it clearly isn't draining
 and the pump is the thing worth protecting.
 
-The 5 min overflow run is **latched**. The 90% float dropping partway through
+The 2 min overflow run is **latched**. The 90% float dropping partway through
 does not end it, so the 90% float on its own is enough to drain the tray. Until
 this was fixed, the overflow run stopped as soon as the water fell just below
 the float, a few seconds in. That only worked when a healthy 70% float took over
@@ -20,11 +20,11 @@ so they go quiet once the water is below 90% even though the pump keeps running.
 
 The overflow run gets the longer cap on purpose. It is a deadline on one
 uninterrupted run rather than a repeating cycle, there is more water to shift at
-90%, and cutting it off at the normal 4 min would report a blockage that is
-really just a bigger job.
+90%, and cutting it off at the normal cycle length would report a blockage that
+is really just a bigger job.
 
 Both times are **set from the dashboard**, not the source. They are stored on the
-controller and survive a power cut; 4 min and 5 min are only what a freshly
+controller and survive a power cut; 1 min 30 s and 2 min are only what a freshly
 flashed board starts with. See [Run times](#run-times).
 
 The **manual switch is an enable switch, not a run switch.** In its OFF position
@@ -152,7 +152,7 @@ Changes are recorded in the activity log, so a pump that starts behaving
 differently can be traced to the moment someone retimed it.
 
 ```
-POST /api/config?run=240&overflow=300   # either argument, or both
+POST /api/config?run=90&overflow=120    # either argument, or both
 POST /api/config?reset=1                # back to the firmware defaults
 ```
 
@@ -358,7 +358,7 @@ nothing needs typing. Messages from any chat other than `CHAT_ID` are ignored.
 Pump     on
 Level    70% draining
 Switch   on (auto)
-Run      2m 48s left
+Run      1m 12s left
 Runs     12, 0 overflow
 Total    2h 38m
 Uptime   6h 05m
@@ -369,8 +369,8 @@ replies need no timezone handling:
 
 ```
 📋 Recent activity
-2m       pump off, 4m 0s run
-8m       pump on (auto)
+2m       pump off, 1m 30s run
+3m 30s   pump on (auto)
 1h 04m   powered on
 ```
 
